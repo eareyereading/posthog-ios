@@ -69,6 +69,7 @@ public typealias BeforeSendBlock = (PostHogEvent) -> PostHogEvent?
         /// Enable autocapture for iOS
         /// Default: false
         @objc public var captureElementInteractions: Bool = false
+        @objc public var captureScrollViewSwipeInteractions: Bool = false
     #endif
     @objc public var debug: Bool = false
     @objc public var optOut: Bool = false

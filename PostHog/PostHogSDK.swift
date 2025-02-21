@@ -1387,6 +1387,10 @@ let maxRetryDelay = 30.0
         @objc public func isAutocaptureActive() -> Bool {
             isEnabled() && config.captureElementInteractions
         }
+    
+        @objc public func isAutocaptureScrollViewSwipeInteractionsActive() -> Bool {
+            isEnabled() && config.captureScrollViewSwipeInteractions
+        }
     #endif
 
     private func installIntegrations() {

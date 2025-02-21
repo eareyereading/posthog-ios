@@ -214,6 +214,10 @@
             guard shouldTrack(self) else {
                 return
             }
+            
+            guard PostHogSDK.shared.isAutocaptureScrollViewSwipeInteractionsActive() else {
+                return
+            }
 
             // ignore all keyboard events
             if let window, window.isKeyboardWindow {
