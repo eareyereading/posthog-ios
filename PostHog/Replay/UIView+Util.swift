@@ -17,22 +17,40 @@
             return true
         }
 
-        func isNoCapture() -> Bool {
+        func isNoCaptureEvents() -> Bool {
             var isNoCapture = false
             if let identifier = accessibilityIdentifier {
-                isNoCapture = checkLabel(identifier)
+                isNoCapture = checkLabelNoCapatureEvents(identifier)
             }
             // read accessibilityLabel from the parent's view to skip the RCTRecursiveAccessibilityLabel on RN which is slow and may cause an endless loop
             // see https://github.com/facebook/react-native/issues/33084
             if let label = super.accessibilityLabel, !isNoCapture {
-                isNoCapture = checkLabel(label)
+                isNoCapture = checkLabelNoCapatureEvents(label)
+            }
+
+            return isNoCapture
+        }
+        
+        func isNoCaptureReplays() -> Bool {
+            var isNoCapture = false
+            if let identifier = accessibilityIdentifier {
+                isNoCapture = checkLabelNoCapatureReplays(identifier)
+            }
+            // read accessibilityLabel from the parent's view to skip the RCTRecursiveAccessibilityLabel on RN which is slow and may cause an endless loop
+            // see https://github.com/facebook/react-native/issues/33084
+            if let label = super.accessibilityLabel, !isNoCapture {
+                isNoCapture = checkLabelNoCapatureReplays(label)
             }
 
             return isNoCapture
         }
 
-        private func checkLabel(_ label: String) -> Bool {
-            label.lowercased().contains("ph-no-capture")
+        private func checkLabelNoCapatureEvents(_ label: String) -> Bool {
+            label.lowercased().contains("ph-no-capture-events")
+        }
+        
+        private func checkLabelNoCapatureReplays(_ label: String) -> Bool {
+            label.lowercased().contains("ph-no-capture-replays")
         }
 
         func toImage() -> UIImage? {
@@ -53,10 +71,10 @@
             // rendererFormat.scale = 0.5
             let renderer = UIGraphicsImageRenderer(size: size, format: rendererFormat)
 
-            let image = renderer.image { _ in
+            let image = renderer.image {[weak self] _ in
                 /// Note: Always `false` for `afterScreenUpdates` since this will cause the screen to flicker when a sensitive text field is visible on screen
                 /// This can potentially affect capturing a snapshot during a screen transition but we want the lesser of the two evils here
-                drawHierarchy(in: bounds, afterScreenUpdates: false)
+                self?.drawHierarchy(in: bounds, afterScreenUpdates: false)
             }
 
             return image

@@ -534,7 +534,7 @@
     private func shouldTrack(_ view: UIView) -> Bool {
         if view.isHidden { return false }
         if !view.isUserInteractionEnabled { return false }
-        if view.isNoCapture() { return false }
+        if view.isNoCaptureEvents() { return false }
         if view.window?.isKeyboardWindow == true { return false }
 
         if let textField = view as? UITextField, textField.isSensitiveText() {

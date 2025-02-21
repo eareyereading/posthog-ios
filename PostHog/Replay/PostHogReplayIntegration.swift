@@ -528,7 +528,7 @@
 
             // on RN, lots get converted to RCTRootContentView, RCTRootView, RCTView and sometimes its just the whole screen, we dont want to mask
             // in such cases
-            if view.isNoCapture() || maskChildren {
+            if view.isNoCaptureReplays() || maskChildren {
                 let viewRect = view.toAbsoluteRect(window)
                 let windowRect = window.frame
 
@@ -613,7 +613,7 @@
         }
 
         private func isTextInputSensitive(_ view: UIView) -> Bool {
-            config?.sessionReplayConfig.maskAllTextInputs == true || view.isNoCapture()
+            config?.sessionReplayConfig.maskAllTextInputs == true || view.isNoCaptureReplays()
         }
 
         private func isLabelSensitive(_ view: UILabel) -> Bool {
@@ -657,7 +657,7 @@
         private func isSwiftUIImageSensitive(_ view: UIView) -> Bool {
             // No way of checking if this is an asset image or not
             // No way of checking if there's actual content in the image or not
-            config?.sessionReplayConfig.maskAllImages == true || view.isNoCapture()
+            config?.sessionReplayConfig.maskAllImages == true || view.isNoCaptureReplays()
         }
 
         private func isImageViewSensitive(_ view: UIImageView) -> Bool {
@@ -665,7 +665,7 @@
             guard let image = view.image else { return false }
 
             // sensitive, regardless
-            if view.isNoCapture() {
+            if view.isNoCaptureReplays() {
                 return true
             }
 
