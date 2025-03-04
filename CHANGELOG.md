@@ -1,5 +1,19 @@
 ## Next
 
+## 3.20.0 - 2025-03-04
+
+- feat: support multiple SDK instances ([#310](https://github.com/PostHog/posthog-ios/pull/310))
+> Note: Now event storage is per API key. Any pending events in legacy storage will be migrated to the first API key used.  
+
+## 3.19.9 - 2025-02-28
+
+- fix: SwiftUI view masking when using clipShape view modifier ([#312](https://github.com/PostHog/posthog-ios/pull/312))
+- fix: reported crash on PostHogSessionManager ([#311](https://github.com/PostHog/posthog-ios/pull/311))
+
+## 3.19.8 - 2025-02-26
+
+- feat: add support for quota-limited feature flags ([#308](https://github.com/PostHog/posthog-ios/pull/308))
+
 ## 3.19.7 - 2025-02-20
 
 - fix: recordings not always properly masked during screen transitions ([#306](https://github.com/PostHog/posthog-ios/pull/306))
