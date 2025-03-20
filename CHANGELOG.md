@@ -1,5 +1,10 @@
 ## Next
 
+## 3.20.1 - 2025-03-13
+
+- fix: disk storage not working on tvOS ([#316](https://github.com/PostHog/posthog-ios/pull/316))
+- fix: wrong is_identified fallback value ([#317](https://github.com/PostHog/posthog-ios/pull/317))
+
 ## 3.20.0 - 2025-03-04
 
 - feat: support multiple SDK instances ([#310](https://github.com/PostHog/posthog-ios/pull/310))
