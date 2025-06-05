@@ -1,5 +1,68 @@
 ## Next
 
+## 3.26.2 - 2025-06-03
+
+- fix: pause network capture when app is backgrounded ([#352](https://github.com/PostHog/posthog-ios/pull/352))
+- fix: prevent duplicate application lifecycle events ([#354](https://github.com/PostHog/posthog-ios/pull/354))
+
+## 3.26.1 - 2025-05-30
+
+- fix: clear cached flags if remote config response hasFeatureFlags is false ([#347](https://github.com/PostHog/posthog-ios/pull/347))§
+
+## 3.26.0 - 2025-05-20
+
+- feat: capture console logs for session replay ([#350](https://github.com/PostHog/posthog-ios/pull/350))
+
+## 3.25.1 - 2025-05-13
+
+- fix: edge case where session manager would not rotate session id ([#349](https://github.com/PostHog/posthog-ios/pull/349))
+
+## 3.25.0 - 2025-04-30
+
+- feat: add support for conditional survey questions ([#343](https://github.com/PostHog/posthog-ios/pull/343))
+
+## 3.24.3 - 2025-04-29
+
+- fix: feature flags not loading on sdk init ([#346](https://github.com/PostHog/posthog-ios/pull/346))
+
+## 3.24.2 - 2025-04-24
+
+- fix: optional link in survey question type ([#341](https://github.com/PostHog/posthog-ios/pull/341))
+- fix: app hangs on iPad with floating keyboard when session replay is enabled ([#340](https://github.com/PostHog/posthog-ios/pull/340))
+
+## 3.24.1 - 2025-04-23
+
+- fix: Send correct `$feature_flag_response` for the `$feature_flag_called` event when calling `isFeatureEnabled` ([#337](https://github.com/PostHog/posthog-ios/pull/337))
+- fix: support ISO8601 dates with missing milliseconds ([#338](https://github.com/PostHog/posthog-ios/pull/338))
+
+## 3.24.0 - 2025-04-17
+
+- chore: Autocapture GA ([#334](https://github.com/PostHog/posthog-ios/pull/334))
+- feat: reuse `anonymousId` between user changes ([#332](https://github.com/PostHog/posthog-ios/pull/332))
+
+## 3.23.0 - 2025-04-14
+
+- fix: postHogMask() view modifier breaks navigation bar ([#331](https://github.com/PostHog/posthog-ios/pull/331))
+- fix: manually start session recording even when `config.sessionReplay` is disabled ([#330](https://github.com/PostHog/posthog-ios/pull/330))
+- feat: start/stop integrations when calling optIn() or optOut() ([#329](https://github.com/PostHog/posthog-ios/pull/329))
+- feat: add `$feature_flag_id`, `$feature_flag_version`, `$feature_flag_reason` and `$feature_flag_request_id` properties to `$feature_flag_called` event ([#327](https://github.com/PostHog/posthog-ios/pull/327))
+
+## 3.22.1 - 2025-04-10
+
+- no user facing changes
+
+## 3.22.0 - 2025-04-09
+
+- feat: add support for surveys on iOS ([#325](https://github.com/PostHog/posthog-ios/pull/325))
+
+## 3.21.0 - 2025-03-28
+
+- fix: visionOS builds ([#291](https://github.com/PostHog/posthog-ios/pull/291))
+Thanks @harlanhaskins ❤️
+
+- feat: improve session replay throttle logic ([#322](https://github.com/PostHog/posthog-ios/pull/322))
+> Note: `debouncerDelay` is deprecated and will be removed in next major update. Use `throttleDelay` instead which provides identical functionality for controlling session replay capture frequency.
+
 ## 3.20.1 - 2025-03-13
 
 - fix: disk storage not working on tvOS ([#316](https://github.com/PostHog/posthog-ios/pull/316))

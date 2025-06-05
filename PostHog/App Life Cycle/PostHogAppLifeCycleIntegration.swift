@@ -19,15 +19,18 @@ import Foundation
 final class PostHogAppLifeCycleIntegration: PostHogIntegration {
     private static var integrationInstalledLock = NSLock()
     private static var integrationInstalled = false
+    private static var didCaptureAppInstallOrUpdate = false
 
     private weak var postHog: PostHogSDK?
 
-    private var appFromBackground = false
+    // True if the app is launched for the first time
+    private var isFreshAppLaunch = true
+    // Manually maintained flag to determine background status of the app
+    private var isAppBackgrounded: Bool = true
 
     private var didBecomeActiveToken: RegistrationToken?
     private var didEnterBackgroundToken: RegistrationToken?
     private var didFinishLaunchingToken: RegistrationToken?
-    private var didCaptureAppInstallOrUpdate = false
 
     func install(_ postHog: PostHogSDK) throws {
         try PostHogAppLifeCycleIntegration.integrationInstalledLock.withLock {
@@ -80,9 +83,11 @@ final class PostHogAppLifeCycleIntegration: PostHogIntegration {
     }
 
     private func captureAppInstallOrUpdated() {
-        guard let postHog, !didCaptureAppInstallOrUpdate else { return }
+        // Check if Application Installed or Application Updated was already checked in the lifecycle of this app
+        // This can be called multiple times in case of optOut, multiple instances or start/stop integration
+        guard let postHog, !PostHogAppLifeCycleIntegration.didCaptureAppInstallOrUpdate else { return }
 
-        didCaptureAppInstallOrUpdate = true
+        PostHogAppLifeCycleIntegration.didCaptureAppInstallOrUpdate = true
 
         if !postHog.config.captureApplicationLifecycleEvents {
             hedgeLog("Skipping Application Installed/Application Updated event - captureApplicationLifecycleEvents is disabled in configuration")
@@ -142,15 +147,22 @@ final class PostHogAppLifeCycleIntegration: PostHogIntegration {
     private func captureAppOpened() {
         guard let postHog else { return }
 
+        guard isAppBackgrounded else {
+            hedgeLog("Skipping Application Opened event - app already in foreground")
+            return
+        }
+
+        isAppBackgrounded = false
+
         if !postHog.config.captureApplicationLifecycleEvents {
             hedgeLog("Skipping Application Opened event - captureApplicationLifecycleEvents is disabled in configuration")
             return
         }
 
         var props: [String: Any] = [:]
-        props["from_background"] = appFromBackground
+        props["from_background"] = !isFreshAppLaunch
 
-        if !appFromBackground {
+        if isFreshAppLaunch {
             let bundle = Bundle.main
 
             let versionName = bundle.infoDictionary?["CFBundleShortVersionString"] as? String
@@ -163,7 +175,7 @@ final class PostHogAppLifeCycleIntegration: PostHogIntegration {
                 props["build"] = versionCode
             }
 
-            appFromBackground = true
+            isFreshAppLaunch = false
         }
 
         postHog.capture("Application Opened", properties: props)
@@ -171,6 +183,13 @@ final class PostHogAppLifeCycleIntegration: PostHogIntegration {
 
     private func captureAppBackgrounded() {
         guard let postHog else { return }
+
+        guard !isAppBackgrounded else {
+            hedgeLog("Skipping Application Opened event - app already in background")
+            return
+        }
+
+        isAppBackgrounded = true
 
         if !postHog.config.captureApplicationLifecycleEvents {
             hedgeLog("Skipping Application Backgrounded event - captureApplicationLifecycleEvents is disabled in configuration")
@@ -184,6 +203,7 @@ final class PostHogAppLifeCycleIntegration: PostHogIntegration {
 #if TESTING
     extension PostHogAppLifeCycleIntegration {
         static func clearInstalls() {
+            PostHogAppLifeCycleIntegration.didCaptureAppInstallOrUpdate = false
             integrationInstalledLock.withLock {
                 integrationInstalled = false
             }

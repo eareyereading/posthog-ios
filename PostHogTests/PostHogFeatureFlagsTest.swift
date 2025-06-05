@@ -1,385 +1,192 @@
 //
 //  PostHogFeatureFlagsTest.swift
-//  PostHogTests
+//  PostHog
 //
-//  Created by Manoel Aranda Neto on 30.10.23.
+//  Created by Yiannis Josephides on 20/01/2025.
 //
 
-import Foundation
-import Nimble
 @testable import PostHog
-import Quick
+import Testing
+import XCTest
 
-class PostHogFeatureFlagsTest: QuickSpec {
-    let config = PostHogConfig(apiKey: "123", host: "http://localhost:9001")
-
-    func getSut(storage: PostHogStorage? = nil) -> PostHogFeatureFlags {
-        let theStorage = storage ?? PostHogStorage(config)
-        let api = PostHogApi(config)
-        return PostHogFeatureFlags(config, theStorage, api)
-    }
-
-    override func spec() {
+@Suite("Test Feature Flags", .serialized)
+enum PostHogFeatureFlagsTest {
+    class BaseTestClass {
+        let config = PostHogConfig(apiKey: testAPIKey, host: "http://localhost:9001")
         var server: MockPostHogServer!
 
-        beforeEach {
-            server = MockPostHogServer()
+        init() {
+            server = MockPostHogServer(version: 4)
             server.start()
+            // important!
+            let storage = PostHogStorage(config)
+            storage.reset()
         }
-        afterEach {
+
+        deinit {
             server.stop()
+            server = nil
         }
 
-        it("returns true for enabled flag - boolean") {
-            let sut = self.getSut()
-            let group = DispatchGroup()
-            group.enter()
+        func getSut(
+            storage: PostHogStorage? = nil,
+            config: PostHogConfig? = nil
+        ) -> PostHogRemoteConfig {
+            let theConfig = config ?? self.config
+            let theStorage = storage ?? PostHogStorage(theConfig)
+            let api = PostHogApi(theConfig)
+            return PostHogRemoteConfig(theConfig, theStorage, api)
+        }
+    }
 
-            sut.loadFeatureFlags(distinctId: "distinctId", anonymousId: "anonymousId", groups: ["group": "value"], callback: {
-                group.leave()
-            })
+    @Suite("Test getFeatureFlag")
+    class TestGetFeatureFlagValue: BaseTestClass {
+        @Test("Returns true for enabled Bool flag")
+        func returnsTrueBoolean() async {
+            let sut = getSut()
 
-            group.wait()
+            await withCheckedContinuation { continuation in
+                sut.loadFeatureFlags(distinctId: "distinctId", anonymousId: "anonymousId", groups: ["group": "value"], callback: { _ in
+                    continuation.resume()
+                })
+            }
 
-            expect(sut.isFeatureEnabled("bool-value")) == true
+            #expect(sut.getFeatureFlag("bool-value") as? Bool == true)
         }
 
-        it("returns true for enabled flag - string") {
-            let sut = self.getSut()
-            let group = DispatchGroup()
-            group.enter()
+        @Test("Returns true for enabled String flag")
+        func returnsTrueString() async {
+            let sut = getSut()
 
-            sut.loadFeatureFlags(distinctId: "distinctId", anonymousId: "anonymousId", groups: ["group": "value"], callback: {
-                group.leave()
-            })
+            await withCheckedContinuation { continuation in
+                sut.loadFeatureFlags(distinctId: "distinctId", anonymousId: "anonymousId", groups: ["group": "value"], callback: { _ in
+                    continuation.resume()
+                })
+            }
 
-            group.wait()
-
-            expect(sut.isFeatureEnabled("string-value")) == true
+            #expect(sut.getFeatureFlag("string-value") as? String == "test")
         }
 
-        it("returns false for disabled flag") {
-            let sut = self.getSut()
-            let group = DispatchGroup()
-            group.enter()
+        @Test("Returns false for disabled flag")
+        func returnsFalseDisabled() async {
+            let sut = getSut()
 
-            sut.loadFeatureFlags(distinctId: "distinctId", anonymousId: "anonymousId", groups: ["group": "value"], callback: {
-                group.leave()
-            })
+            await withCheckedContinuation { continuation in
+                sut.loadFeatureFlags(distinctId: "distinctId", anonymousId: "anonymousId", groups: ["group": "value"], callback: { _ in
+                    continuation.resume()
+                })
+            }
 
-            group.wait()
-
-            expect(sut.isFeatureEnabled("disabled-flag")) == false
+            #expect(sut.getFeatureFlag("disabled-flag") as? Bool == false)
         }
 
-        it("returns feature flag value") {
-            let sut = self.getSut()
-            let group = DispatchGroup()
-            group.enter()
+        @Test("returns feature flag value")
+        func getFeatureFlagValue() async {
+            let sut = getSut()
 
-            sut.loadFeatureFlags(distinctId: "distinctId", anonymousId: "anonymousId", groups: ["group": "value"], callback: {
-                group.leave()
-            })
+            await withCheckedContinuation { continuation in
+                sut.loadFeatureFlags(distinctId: "distinctId", anonymousId: "anonymousId", groups: ["group": "value"], callback: { _ in
+                    continuation.resume()
+                })
+            }
 
-            group.wait()
+            #expect(sut.getFeatureFlag("string-value") as? String == "test")
+        }
+    }
 
-            expect(sut.getFeatureFlag("string-value") as? String) == "test"
+    @Suite("Test getFeatureFlagPayload")
+    class TestGetFeatureFlagPayload: BaseTestClass {
+        @Test("returns feature flag payload as Int")
+        func getFeatureFlagPayloadInt() async {
+            let sut = getSut()
+
+            await withCheckedContinuation { continuation in
+                sut.loadFeatureFlags(distinctId: "distinctId", anonymousId: "anonymousId", groups: ["group": "value"], callback: { _ in
+                    continuation.resume()
+                })
+            }
+
+            #expect(sut.getFeatureFlagPayload("number-value") as? Int == 2)
         }
 
-        it("returns feature flag payload") {
-            let sut = self.getSut()
-            let group = DispatchGroup()
-            group.enter()
+        @Test("returns feature flag payload as Dictionary")
+        func getFeatureFlagPayloadDictionary() async {
+            let sut = getSut()
 
-            sut.loadFeatureFlags(distinctId: "distinctId", anonymousId: "anonymousId", groups: ["group": "value"], callback: {
-                group.leave()
-            })
+            await withCheckedContinuation { continuation in
+                sut.loadFeatureFlags(distinctId: "distinctId", anonymousId: "anonymousId", groups: ["group": "value"], callback: { _ in
+                    continuation.resume()
+                })
+            }
 
-            group.wait()
+            #expect(sut.getFeatureFlagPayload("payload-json") as? [String: String] == ["foo": "bar"])
+        }
+    }
 
-            expect(sut.getFeatureFlagPayload("number-value") as? Int) == 2
+    @Suite("Test feature flags loading")
+    class TestLoadFeatureFlagsLoading: BaseTestClass {
+        @Test("loads cached feature flags")
+        func loadsCachedFeatureFlags() {
+            let storage = PostHogStorage(config)
+            defer { storage.reset() }
+
+            storage.setDictionary(forKey: .enabledFeatureFlags, contents: ["foo": "bar"])
+
+            let sut = getSut(storage: storage)
+
+            #expect(sut.getFeatureFlags() as? [String: String] == ["foo": "bar"])
         }
 
-        it("returns feature flag payload as dict") {
-            let sut = self.getSut()
-            let group = DispatchGroup()
-            group.enter()
+        @Test("merge flags if computed errors")
+        func mergeFlagsIfComputedErrors() async {
+            let sut = getSut()
 
-            sut.loadFeatureFlags(distinctId: "distinctId", anonymousId: "anonymousId", groups: ["group": "value"], callback: {
-                group.leave()
-            })
-
-            expect(sut.getFeatureFlagPayload("payload-json") as? [String: String]) == ["foo": "bar"]
-        }
-
-        it("merge flags if computed errors") {
-            let sut = self.getSut()
-            let group = DispatchGroup()
-            group.enter()
-
-            sut.loadFeatureFlags(distinctId: "distinctId", anonymousId: "anonymousId", groups: ["group": "value"], callback: {
-                group.leave()
-            })
-
-            group.wait()
+            await withCheckedContinuation { continuation in
+                sut.loadFeatureFlags(distinctId: "distinctId", anonymousId: "anonymousId", groups: ["group": "value"], callback: { _ in
+                    continuation.resume()
+                })
+            }
 
             server.errorsWhileComputingFlags = true
 
-            let group2 = DispatchGroup()
-            group2.enter()
+            await withCheckedContinuation { continuation in
+                sut.loadFeatureFlags(distinctId: "distinctId", anonymousId: "anonymousId", groups: ["group": "value"], callback: { _ in
+                    continuation.resume()
+                })
+            }
 
-            sut.loadFeatureFlags(distinctId: "distinctId", anonymousId: "anonymousId", groups: ["group": "value"], callback: {
-                group2.leave()
-            })
-
-            group2.wait()
-
-            expect(sut.isFeatureEnabled("new-flag")) == true
-            expect(sut.isFeatureEnabled("bool-value")) == true
+            #expect(sut.getFeatureFlag("new-flag") as? Bool == true)
+            #expect(sut.getFeatureFlag("bool-value") as? Bool == true)
         }
 
-        it("clears feature flags when quota limited") {
-            let sut = self.getSut()
-            let group = DispatchGroup()
-            group.enter()
+        @Test("clears feature flags when quota limited")
+        func clearsFeatureFlagsWhenQuotaLimited() async {
+            let sut = getSut()
 
             // First load some feature flags normally
-            sut.loadFeatureFlags(distinctId: "distinctId", anonymousId: "anonymousId", groups: ["group": "value"], callback: {
-                group.leave()
-            })
-
-            group.wait()
+            await withCheckedContinuation { continuation in
+                sut.loadFeatureFlags(distinctId: "distinctId", anonymousId: "anonymousId", groups: ["group": "value"], callback: { _ in
+                    continuation.resume()
+                })
+            }
 
             // Verify flags are loaded
-            expect(sut.isFeatureEnabled("bool-value")) == true
-            expect(sut.getFeatureFlag("string-value") as? String) == "test"
+            #expect(sut.getFeatureFlag("bool-value") as? Bool == true)
+            #expect(sut.getFeatureFlag("string-value") as? String == "test")
 
             // Now set the server to return quota limited response
             server.quotaLimitFeatureFlags = true
 
-            let group2 = DispatchGroup()
-            group2.enter()
-
             // Load flags again, this time with quota limiting
-            sut.loadFeatureFlags(distinctId: "distinctId", anonymousId: "anonymousId", groups: ["group": "value"], callback: {
-                group2.leave()
-            })
-
-            group2.wait()
+            await withCheckedContinuation { continuation in
+                sut.loadFeatureFlags(distinctId: "distinctId", anonymousId: "anonymousId", groups: ["group": "value"], callback: { _ in
+                    continuation.resume()
+                })
+            }
 
             // Verify flags are cleared
-            expect(sut.isFeatureEnabled("bool-value")) == false
-            expect(sut.getFeatureFlag("string-value")).to(beNil())
+            #expect(sut.getFeatureFlag("bool-value") == nil)
+            #expect(sut.getFeatureFlag("string-value") == nil)
         }
-
-        #if os(iOS)
-            it("returns isSessionReplayFlagActive true if there is a value") {
-                let storage = PostHogStorage(self.config)
-
-                let recording: [String: Any] = ["test": 1]
-                storage.setDictionary(forKey: .sessionReplay, contents: recording)
-
-                let sut = self.getSut(storage: storage)
-
-                expect(sut.isSessionReplayFlagActive()) == true
-
-                storage.reset()
-            }
-
-            it("returns isSessionReplayFlagActive false if there is no value") {
-                let sut = self.getSut()
-
-                expect(sut.isSessionReplayFlagActive()) == false
-            }
-
-            it("returns isSessionReplayFlagActive false if feature flag disabled") {
-                let storage = PostHogStorage(self.config)
-
-                let recording: [String: Any] = ["test": 1]
-                storage.setDictionary(forKey: .sessionReplay, contents: recording)
-
-                let sut = self.getSut(storage: storage)
-
-                expect(sut.isSessionReplayFlagActive()) == true
-
-                let group = DispatchGroup()
-                group.enter()
-
-                sut.loadFeatureFlags(distinctId: "distinctId", anonymousId: "anonymousId", groups: ["group": "value"], callback: {
-                    group.leave()
-                })
-
-                group.wait()
-
-                expect(storage.getDictionary(forKey: .sessionReplay)) == nil
-                expect(sut.isSessionReplayFlagActive()) == false
-
-                storage.reset()
-            }
-
-            it("returns isSessionReplayFlagActive true if feature flag active") {
-                let storage = PostHogStorage(self.config)
-
-                let sut = self.getSut(storage: storage)
-
-                expect(sut.isSessionReplayFlagActive()) == false
-
-                let group = DispatchGroup()
-                group.enter()
-
-                server.returnReplay = true
-
-                sut.loadFeatureFlags(distinctId: "distinctId", anonymousId: "anonymousId", groups: ["group": "value"], callback: {
-                    group.leave()
-                })
-
-                group.wait()
-
-                expect(storage.getDictionary(forKey: .sessionReplay)) != nil
-                expect(self.config.snapshotEndpoint) == "/newS/"
-                expect(sut.isSessionReplayFlagActive()) == true
-
-                storage.reset()
-            }
-
-            it("returns isSessionReplayFlagActive true if bool linked flag is enabled") {
-                let storage = PostHogStorage(self.config)
-
-                let sut = self.getSut(storage: storage)
-
-                expect(sut.isSessionReplayFlagActive()) == false
-
-                let group = DispatchGroup()
-                group.enter()
-
-                server.returnReplay = true
-                server.returnReplayWithVariant = true
-
-                sut.loadFeatureFlags(distinctId: "distinctId", anonymousId: "anonymousId", groups: ["group": "value"], callback: {
-                    group.leave()
-                })
-
-                group.wait()
-
-                expect(storage.getDictionary(forKey: .sessionReplay)) != nil
-                expect(self.config.snapshotEndpoint) == "/newS/"
-                expect(sut.isSessionReplayFlagActive()) == true
-
-                storage.reset()
-            }
-
-            it("returns isSessionReplayFlagActive false if bool linked flag is disabled") {
-                let storage = PostHogStorage(self.config)
-
-                let sut = self.getSut(storage: storage)
-
-                expect(sut.isSessionReplayFlagActive()) == false
-
-                let group = DispatchGroup()
-                group.enter()
-
-                server.returnReplay = true
-                server.returnReplayWithVariant = true
-                server.replayVariantValue = false
-
-                sut.loadFeatureFlags(distinctId: "distinctId", anonymousId: "anonymousId", groups: ["group": "value"], callback: {
-                    group.leave()
-                })
-
-                group.wait()
-
-                expect(storage.getDictionary(forKey: .sessionReplay)) != nil
-                expect(self.config.snapshotEndpoint) == "/newS/"
-                expect(sut.isSessionReplayFlagActive()) == false
-
-                storage.reset()
-            }
-
-            it("returns isSessionReplayFlagActive true if multi variant linked flag is a match") {
-                let storage = PostHogStorage(self.config)
-
-                let sut = self.getSut(storage: storage)
-
-                expect(sut.isSessionReplayFlagActive()) == false
-
-                let group = DispatchGroup()
-                group.enter()
-
-                server.returnReplay = true
-                server.returnReplayWithVariant = true
-                server.returnReplayWithMultiVariant = true
-                server.replayVariantName = "recording-platform"
-                server.replayVariantValue = ["flag": "recording-platform-check", "variant": "web"]
-
-                sut.loadFeatureFlags(distinctId: "distinctId", anonymousId: "anonymousId", groups: ["group": "value"], callback: {
-                    group.leave()
-                })
-
-                group.wait()
-
-                expect(storage.getDictionary(forKey: .sessionReplay)) != nil
-                expect(self.config.snapshotEndpoint) == "/newS/"
-                expect(sut.isSessionReplayFlagActive()) == true
-
-                storage.reset()
-            }
-
-            it("returns isSessionReplayFlagActive false if multi variant linked flag is not a match") {
-                let storage = PostHogStorage(self.config)
-
-                let sut = self.getSut(storage: storage)
-
-                expect(sut.isSessionReplayFlagActive()) == false
-
-                let group = DispatchGroup()
-                group.enter()
-
-                server.returnReplay = true
-                server.returnReplayWithVariant = true
-                server.returnReplayWithMultiVariant = true
-                server.replayVariantName = "recording-platform"
-                server.replayVariantValue = ["flag": "recording-platform-check", "variant": "mobile"]
-
-                sut.loadFeatureFlags(distinctId: "distinctId", anonymousId: "anonymousId", groups: ["group": "value"], callback: {
-                    group.leave()
-                })
-
-                group.wait()
-
-                expect(storage.getDictionary(forKey: .sessionReplay)) != nil
-                expect(self.config.snapshotEndpoint) == "/newS/"
-                expect(sut.isSessionReplayFlagActive()) == false
-
-                storage.reset()
-            }
-
-            it("returns isSessionReplayFlagActive false if bool linked flag is missing") {
-                let storage = PostHogStorage(self.config)
-
-                let sut = self.getSut(storage: storage)
-
-                expect(sut.isSessionReplayFlagActive()) == false
-
-                let group = DispatchGroup()
-                group.enter()
-
-                server.returnReplay = true
-                server.returnReplayWithVariant = true
-                server.replayVariantName = "some-missing-flag"
-                server.flagsSkipReplayVariantName = true
-
-                sut.loadFeatureFlags(distinctId: "distinctId", anonymousId: "anonymousId", groups: ["group": "value"], callback: {
-                    group.leave()
-                })
-
-                group.wait()
-
-                expect(storage.getDictionary(forKey: .sessionReplay)) != nil
-                expect(self.config.snapshotEndpoint) == "/newS/"
-                expect(sut.isSessionReplayFlagActive()) == false
-
-                storage.reset()
-            }
-        #endif
     }
 }

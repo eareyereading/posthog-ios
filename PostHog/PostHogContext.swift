@@ -7,7 +7,7 @@
 
 import Foundation
 
-#if os(iOS) || os(tvOS)
+#if os(iOS) || os(tvOS) || os(visionOS)
     import UIKit
 #elseif os(macOS)
     import AppKit
@@ -47,36 +47,24 @@ class PostHogContext {
         properties["$device_manufacturer"] = "Apple"
         properties["$device_model"] = platform()
 
-        #if targetEnvironment(simulator)
-            properties["$is_emulator"] = true
-        #else
-            properties["$is_emulator"] = false
-        #endif
+        if let deviceType = PostHogContext.deviceType {
+            properties["$device_type"] = deviceType
+        }
 
-        // iOS app running in compatibility mode (Designed for iPad/iPhone)
-        var isiOSAppOnMac = false
-        #if os(iOS)
-            if #available(iOS 14.0, *) {
-                isiOSAppOnMac = ProcessInfo.processInfo.isiOSAppOnMac
-            }
-        #endif
+        properties["$is_emulator"] = PostHogContext.isSimulator
 
-        // iPad app running on Mac Catalyst
-        #if targetEnvironment(macCatalyst)
-            let isMacCatalystApp = true
-        #else
-            let isMacCatalystApp = false
-        #endif
+        let isIOSAppOnMac = PostHogContext.isIOSAppOnMac
+        let isMacCatalystApp = PostHogContext.isMacCatalystApp
 
-        properties["$is_ios_running_on_mac"] = isiOSAppOnMac
+        properties["$is_ios_running_on_mac"] = isIOSAppOnMac
         properties["$is_mac_catalyst_app"] = isMacCatalystApp
 
-        #if os(iOS) || os(tvOS)
+        #if os(iOS) || os(tvOS) || os(visionOS)
             let device = UIDevice.current
             // use https://github.com/devicekit/DeviceKit
             let processInfo = ProcessInfo.processInfo
 
-            if isMacCatalystApp || isiOSAppOnMac {
+            if isMacCatalystApp || isIOSAppOnMac {
                 let underlyingOS = device.systemName
                 let underlyingOSVersion = device.systemVersion
                 let macOSVersion = processInfo.operatingSystemVersionString
@@ -98,32 +86,12 @@ class PostHogContext {
                 //
                 // Source: https://developer.apple.com/documentation/apple-silicon/adapting-ios-code-to-run-in-the-macos-environment#Handle-unknown-device-types-gracefully
                 properties["$os_name"] = "macOS"
-                properties["$device_type"] = "Desktop"
                 properties["$device_name"] = processInfo.hostName
             } else {
                 // use https://github.com/devicekit/DeviceKit
                 properties["$os_name"] = device.systemName
                 properties["$os_version"] = device.systemVersion
                 properties["$device_name"] = device.model
-
-                var deviceType: String?
-                switch device.userInterfaceIdiom {
-                case UIUserInterfaceIdiom.phone:
-                    deviceType = "Mobile"
-                case UIUserInterfaceIdiom.pad:
-                    deviceType = "Tablet"
-                case UIUserInterfaceIdiom.tv:
-                    deviceType = "TV"
-                case UIUserInterfaceIdiom.carPlay:
-                    deviceType = "CarPlay"
-                case UIUserInterfaceIdiom.mac:
-                    deviceType = "Desktop"
-                default:
-                    deviceType = nil
-                }
-                if deviceType != nil {
-                    properties["$device_type"] = deviceType
-                }
             }
         #elseif os(macOS)
             let deviceName = Host.current().localizedName
@@ -134,7 +102,6 @@ class PostHogContext {
             properties["$os_name"] = "macOS"
             let osVersion = processInfo.operatingSystemVersion
             properties["$os_version"] = "\(osVersion.majorVersion).\(osVersion.minorVersion).\(osVersion.patchVersion)"
-            properties["$device_type"] = "Desktop"
         #endif
 
         return properties
@@ -188,7 +155,7 @@ class PostHogContext {
         // - "hw.model" returns mac model
         #if targetEnvironment(macCatalyst)
             sysctlName = "hw.model"
-        #elseif os(iOS)
+        #elseif os(iOS) || os(visionOS)
             if #available(iOS 14.0, *) {
                 if ProcessInfo.processInfo.isiOSAppOnMac {
                     sysctlName = "hw.model"
@@ -211,8 +178,14 @@ class PostHogContext {
             properties["$screen_height"] = Float(screenSize.height)
         }
 
-        if Locale.current.languageCode != nil {
-            properties["$locale"] = Locale.current.languageCode
+        if #available(iOS 16.0, macOS 13.0, tvOS 16.0, watchOS 9.0, *) {
+            if let languageCode = Locale.current.language.languageCode {
+                properties["$locale"] = languageCode.identifier
+            }
+        } else {
+            if Locale.current.languageCode != nil {
+                properties["$locale"] = Locale.current.languageCode
+            }
         }
         properties["$timezone"] = TimeZone.current.identifier
 
@@ -227,7 +200,7 @@ class PostHogContext {
     }
 
     private func registerNotifications() {
-        #if os(iOS) || os(tvOS)
+        #if os(iOS) || os(tvOS) || os(visionOS)
             #if os(iOS)
                 NotificationCenter.default.addObserver(self,
                                                        selector: #selector(onOrientationDidChange),
@@ -262,7 +235,7 @@ class PostHogContext {
     }
 
     private func unregisterNotifications() {
-        #if os(iOS) || os(tvOS)
+        #if os(iOS) || os(tvOS) || os(visionOS)
             #if os(iOS)
                 NotificationCenter.default.removeObserver(self,
                                                           name: UIDevice.orientationDidChangeNotification,
@@ -293,7 +266,7 @@ class PostHogContext {
 
     /// Retrieves the current screen size of the application window based on platform
     private func getScreenSize() -> CGSize? {
-        #if os(iOS) || os(tvOS)
+        #if os(iOS) || os(tvOS) || os(visionOS)
             return UIApplication.getCurrentWindow(filterForegrounded: false)?.bounds.size
         #elseif os(macOS)
             // NSScreen.frame represents the full screen rectangle and includes any space occupied by menu, dock or camera bezel
@@ -336,4 +309,56 @@ class PostHogContext {
             DispatchQueue.main.async(execute: block)
         }
     }
+
+    static let deviceType: String? = {
+        #if os(iOS) || os(tvOS)
+            if isMacCatalystApp || isIOSAppOnMac {
+                return "Desktop"
+            } else {
+                switch UIDevice.current.userInterfaceIdiom {
+                case UIUserInterfaceIdiom.phone:
+                    return "Mobile"
+                case UIUserInterfaceIdiom.pad:
+                    return "Tablet"
+                case UIUserInterfaceIdiom.tv:
+                    return "TV"
+                case UIUserInterfaceIdiom.carPlay:
+                    return "CarPlay"
+                case UIUserInterfaceIdiom.mac:
+                    return "Desktop"
+                case UIUserInterfaceIdiom.vision:
+                    return "Vision"
+                default:
+                    return nil
+                }
+            }
+        #elseif os(macOS)
+            return "Desktop"
+        #else
+            return nil
+        #endif
+    }()
+
+    static let isIOSAppOnMac: Bool = {
+        if #available(iOS 14.0, macOS 11.0, tvOS 14.0, watchOS 7.0, *) {
+            return ProcessInfo.processInfo.isiOSAppOnMac
+        }
+        return false
+    }()
+
+    static let isMacCatalystApp: Bool = {
+        #if targetEnvironment(macCatalyst)
+            true
+        #else
+            false
+        #endif
+    }()
+
+    static let isSimulator: Bool = {
+        #if targetEnvironment(simulator)
+            true
+        #else
+            false
+        #endif
+    }()
 }

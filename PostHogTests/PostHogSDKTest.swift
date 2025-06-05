@@ -20,7 +20,7 @@ class PostHogSDKTest: QuickSpec {
                 propertiesSanitizer: PostHogPropertiesSanitizer? = nil,
                 personProfiles: PostHogPersonProfiles = .identifiedOnly) -> PostHogSDK
     {
-        let config = PostHogConfig(apiKey: "123", host: "http://localhost:9001")
+        let config = PostHogConfig(apiKey: testAPIKey, host: "http://localhost:9001")
         config.flushAt = flushAt
         config.preloadFeatureFlags = preloadFeatureFlags
         config.sendFeatureFlagEvent = sendFeatureFlagEvent
@@ -54,7 +54,7 @@ class PostHogSDKTest: QuickSpec {
             PostHogAppLifeCycleIntegration.clearInstalls()
 
             deleteDefaults()
-            server = MockPostHogServer()
+            server = MockPostHogServer(version: 4)
             server.start()
 
             DI.main.sessionManager = PostHogSessionManager()
@@ -93,205 +93,6 @@ class PostHogSDKTest: QuickSpec {
 
             let groupProps = event.properties["$groups"] as? [String: String] ?? [:]
             expect(groupProps["groupProp"]) == "value"
-
-            sut.reset()
-            sut.close()
-        }
-
-        it("captures the capture event with a custom distinctId") {
-            let sut = self.getSut()
-
-            sut.capture("event",
-                        distinctId: "the_custom_distinct_id",
-                        properties: ["foo": "bar"],
-                        userProperties: ["userProp": "value"],
-                        userPropertiesSetOnce: ["userPropOnce": "value"],
-                        groups: ["groupProp": "value"])
-
-            let events = getBatchedEvents(server)
-
-            expect(events.count) == 1
-            expect(events.first!.distinctId) == "the_custom_distinct_id"
-
-            sut.reset()
-            sut.close()
-        }
-
-        it("captures an identify event") {
-            let sut = self.getSut()
-
-            sut.identify("distinctId",
-                         userProperties: ["userProp": "value"],
-                         userPropertiesSetOnce: ["userPropOnce": "value"])
-
-            let events = getBatchedEvents(server)
-
-            expect(events.count) == 1
-
-            let event = events.first!
-            expect(event.event) == "$identify"
-
-            expect(event.distinctId) == "distinctId"
-            let anonId = sut.getAnonymousId()
-            expect(event.properties["$anon_distinct_id"] as? String) == anonId
-            expect(event.properties["$is_identified"] as? Bool) == true
-
-            let set = event.properties["$set"] as? [String: Any] ?? [:]
-            expect(set["userProp"] as? String) == "value"
-
-            let setOnce = event.properties["$set_once"] as? [String: Any] ?? [:]
-            expect(setOnce["userPropOnce"] as? String) == "value"
-
-            sut.reset()
-            sut.close()
-        }
-
-        it("captures an event with is identified false") {
-            let sut = self.getSut()
-
-            sut.capture("test",
-                        userProperties: ["userProp": "value"],
-                        userPropertiesSetOnce: ["userPropOnce": "value"])
-
-            let events = getBatchedEvents(server)
-
-            expect(events.count) == 1
-
-            let event = events.first!
-
-            expect(event.properties["$is_identified"] as? Bool) == false
-
-            sut.reset()
-            sut.close()
-        }
-
-        it("does not capture identify event if already identified") {
-            let sut = self.getSut(
-                flushAt: 2
-            )
-
-            sut.identify("distinctId",
-                         userProperties: ["userProp": "value"],
-                         userPropertiesSetOnce: ["userPropOnce": "value"])
-
-            sut.identify("distinctId")
-            sut.capture("satisfy_queue")
-
-            let events = getBatchedEvents(server)
-
-            expect(events.count) == 2
-
-            expect(events[0].event) == "$identify"
-            expect(events[1].event) == "satisfy_queue"
-
-            expect(events[0].distinctId) == "distinctId"
-            let anonId = sut.getAnonymousId()
-            expect(events[0].properties["$anon_distinct_id"] as? String) == anonId
-            expect(events[0].properties["$is_identified"] as? Bool) == true
-
-            let set = events[0].properties["$set"] as? [String: Any] ?? [:]
-            expect(set["userProp"] as? String) == "value"
-
-            let setOnce = events[0].properties["$set_once"] as? [String: Any] ?? [:]
-            expect(setOnce["userPropOnce"] as? String) == "value"
-
-            sut.reset()
-            sut.close()
-        }
-
-        it("updates user props if already identified but user properties are set") {
-            let sut = self.getSut(
-                flushAt: 2
-            )
-
-            sut.identify("distinctId",
-                         userProperties: ["userProp": "value"],
-                         userPropertiesSetOnce: ["userPropOnce": "value"])
-
-            sut.identify("distinctId",
-                         userProperties: ["userProp2": "value2"],
-                         userPropertiesSetOnce: ["userPropOnce2": "value2"])
-
-            let events = getBatchedEvents(server)
-
-            expect(events.count) == 2
-
-            expect(events[0].event) == "$identify"
-            expect(events[1].event) == "$set"
-
-            expect(events[0].distinctId) == "distinctId"
-            expect(events[1].distinctId) == events[0].distinctId
-
-            let anonId = sut.getAnonymousId()
-            expect(events[0].properties["$anon_distinct_id"] as? String) == anonId
-            expect(events[0].properties["$is_identified"] as? Bool) == true
-
-            let set0 = events[0].properties["$set"] as? [String: Any] ?? [:]
-            expect(set0["userProp"] as? String) == "value"
-
-            let set1 = events[1].properties["$set"] as? [String: Any] ?? [:]
-            expect(set1["userProp2"] as? String) == "value2"
-
-            let setOnce0 = events[0].properties["$set_once"] as? [String: Any] ?? [:]
-            expect(setOnce0["userPropOnce"] as? String) == "value"
-
-            let setOnce1 = events[1].properties["$set_once"] as? [String: Any] ?? [:]
-            expect(setOnce1["userPropOnce2"] as? String) == "value2"
-
-            sut.reset()
-            sut.close()
-        }
-
-        it("does not capture user props for another distinctId even if user properties are set") {
-            let sut = self.getSut(
-                flushAt: 2
-            )
-
-            sut.identify("distinctId",
-                         userProperties: ["userProp": "value"],
-                         userPropertiesSetOnce: ["userPropOnce": "value"])
-
-            sut.identify("distinctId2",
-                         userProperties: ["userProp2": "value2"],
-                         userPropertiesSetOnce: ["userPropOnce2": "value2"])
-
-            sut.capture("satisfy_queue")
-
-            let events = getBatchedEvents(server)
-
-            expect(events.count) == 2
-
-            expect(events[0].event) == "$identify"
-            expect(events[1].event) == "satisfy_queue"
-
-            expect(events[0].distinctId) == "distinctId"
-            let anonId = sut.getAnonymousId()
-            expect(events[0].properties["$anon_distinct_id"] as? String) == anonId
-            expect(events[0].properties["$is_identified"] as? Bool) == true
-
-            let set = events[0].properties["$set"] as? [String: Any] ?? [:]
-            expect(set["userProp"] as? String) == "value"
-
-            let setOnce = events[0].properties["$set_once"] as? [String: Any] ?? [:]
-            expect(setOnce["userPropOnce"] as? String) == "value"
-
-            sut.reset()
-            sut.close()
-        }
-
-        it("captures an alias event") {
-            let sut = self.getSut()
-
-            sut.alias("theAlias")
-
-            let events = getBatchedEvents(server)
-
-            expect(events.count) == 1
-
-            let event = events.first!
-            expect(event.event) == "$create_alias"
-
-            expect(event.properties["alias"] as? String) == "theAlias"
 
             sut.reset()
             sut.close()
@@ -337,16 +138,6 @@ class PostHogSDKTest: QuickSpec {
             sut.close()
         }
 
-        it("setups default IDs") {
-            let sut = self.getSut()
-
-            expect(sut.getAnonymousId()).toNot(beNil())
-            expect(sut.getDistinctId()) == sut.getAnonymousId()
-
-            sut.reset()
-            sut.close()
-        }
-
         it("setups optOut") {
             let sut = self.getSut()
 
@@ -368,6 +159,22 @@ class PostHogSDKTest: QuickSpec {
             sut.optOut()
 
             expect(sut.isOptOut()) == true
+
+            sut.reset()
+            sut.close()
+        }
+
+        it("removes all integrations on opt-out") {
+            let sut = self.getSut(
+                captureApplicationLifecycleEvents: true,
+                optOut: false
+            )
+
+            expect(sut.getAppLifeCycleIntegration()).notTo(beNil())
+
+            sut.optOut()
+
+            expect(sut.getAppLifeCycleIntegration()).to(beNil())
 
             sut.reset()
             sut.close()
@@ -406,20 +213,6 @@ class PostHogSDKTest: QuickSpec {
             sut.close()
         }
 
-        it("identify sets distinct and anon Ids") {
-            let sut = self.getSut()
-
-            let distId = sut.getDistinctId()
-
-            sut.identify("newDistinctId")
-
-            expect(sut.getDistinctId()) == "newDistinctId"
-            expect(sut.getAnonymousId()) == distId
-
-            sut.reset()
-            sut.close()
-        }
-
         it("loads feature flags automatically") {
             let sut = self.getSut(preloadFeatureFlags: true)
 
@@ -444,6 +237,33 @@ class PostHogSDKTest: QuickSpec {
             expect(event.event) == "$feature_flag_called"
             expect(event.properties["$feature_flag"] as? String) == "bool-value"
             expect(event.properties["$feature_flag_response"] as? Bool) == true
+            expect(event.properties["$feature_flag_request_id"] as? String) == "0f801b5b-0776-42ca-b0f7-8375c95730bf"
+            expect(event.properties["$feature_flag_id"] as? Int) == 2
+            expect(event.properties["$feature_flag_version"] as? Int) == 23
+            expect(event.properties["$feature_flag_reason"] as? String) == "Matched condition set 3"
+
+            sut.reset()
+            sut.close()
+        }
+
+        it("send feature flag event with variant response for isFeatureEnabled when enabled") {
+            let sut = self.getSut(preloadFeatureFlags: true, sendFeatureFlagEvent: true)
+
+            waitDecideRequest(server)
+            expect(sut.isFeatureEnabled("string-value")) == true
+
+            let events = getBatchedEvents(server)
+
+            expect(events.count) == 1
+
+            let event = events.first!
+            expect(event.event) == "$feature_flag_called"
+            expect(event.properties["$feature_flag"] as? String) == "string-value"
+            expect(event.properties["$feature_flag_response"] as? String) == "test"
+            expect(event.properties["$feature_flag_request_id"] as? String) == "0f801b5b-0776-42ca-b0f7-8375c95730bf"
+            expect(event.properties["$feature_flag_id"] as? Int) == 3
+            expect(event.properties["$feature_flag_version"] as? Int) == 1
+            expect(event.properties["$feature_flag_reason"] as? String) == "Matched condition set 1"
 
             sut.reset()
             sut.close()
@@ -472,11 +292,11 @@ class PostHogSDKTest: QuickSpec {
             let sut = self.getSut()
             // group reloads flags when there are new groups
             // but in this case we want to reload manually and assert the response
-            sut.shouldReloadFlagsForTesting = false
-
+            sut.remoteConfig?.canReloadFlagsForTesting = false
             sut.group(type: "some-type", key: "some-key", groupProperties: [
                 "name": "some-company-name",
             ])
+            sut.remoteConfig?.canReloadFlagsForTesting = true
 
             let events = getBatchedEvents(server)
 
@@ -823,7 +643,7 @@ class PostHogSDKTest: QuickSpec {
         #if os(iOS)
             context("autocapture") {
                 it("isAutocaptureActive() should be false if disabled by config") {
-                    let config = PostHogConfig(apiKey: "1234")
+                    let config = PostHogConfig(apiKey: testAPIKey)
                     config.captureElementInteractions = false
                     let sut = PostHogSDK.with(config)
 
@@ -831,7 +651,7 @@ class PostHogSDKTest: QuickSpec {
                 }
 
                 it("isAutocaptureActive() should be false if SDK is not enabled") {
-                    let config = PostHogConfig(apiKey: "1234")
+                    let config = PostHogConfig(apiKey: testAPIKey)
                     config.captureElementInteractions = true
                     let sut = PostHogSDK.with(config)
                     sut.close()

@@ -87,12 +87,16 @@ class PostHogStorage {
         case replayQeueue = "posthog.replayFolder"
         case enabledFeatureFlags = "posthog.enabledFeatureFlags"
         case enabledFeatureFlagPayloads = "posthog.enabledFeatureFlagPayloads"
+        case flags = "posthog.flags"
         case groups = "posthog.groups"
         case registerProperties = "posthog.registerProperties"
         case optOut = "posthog.optOut"
         case sessionReplay = "posthog.sessionReplay"
         case isIdentified = "posthog.isIdentified"
         case personProcessingEnabled = "posthog.enabledPersonProcessing"
+        case remoteConfig = "posthog.remoteConfig"
+        case surveySeen = "posthog.surveySeen"
+        case requestId = "posthog.requestId"
     }
 
     // The location for storing data that we always want to keep
@@ -105,7 +109,7 @@ class PostHogStorage {
         Self.migrateLegacyStorage(from: config, to: appFolderUrl)
     }
 
-    public func url(forKey key: StorageKey) -> URL {
+    func url(forKey key: StorageKey) -> URL {
         appFolderUrl.appendingPathComponent(key.rawValue)
     }
 
@@ -230,12 +234,15 @@ class PostHogStorage {
         return apiDir
     }
 
-    public func reset() {
+    func reset(keepAnonymousId: Bool = false) {
         // sadly the StorageKey.allCases does not work here
         deleteSafely(url(forKey: .distinctId))
-        deleteSafely(url(forKey: .anonymousId))
+        if !keepAnonymousId {
+            deleteSafely(url(forKey: .anonymousId))
+        }
         // .queue, .replayQeueue not needed since it'll be deleted by the queue.clear()
         deleteSafely(url(forKey: .oldQeueue))
+        deleteSafely(url(forKey: .flags))
         deleteSafely(url(forKey: .enabledFeatureFlags))
         deleteSafely(url(forKey: .enabledFeatureFlagPayloads))
         deleteSafely(url(forKey: .groups))
@@ -244,15 +251,18 @@ class PostHogStorage {
         deleteSafely(url(forKey: .sessionReplay))
         deleteSafely(url(forKey: .isIdentified))
         deleteSafely(url(forKey: .personProcessingEnabled))
+        deleteSafely(url(forKey: .remoteConfig))
+        deleteSafely(url(forKey: .surveySeen))
+        deleteSafely(url(forKey: .requestId))
     }
 
-    public func remove(key: StorageKey) {
+    func remove(key: StorageKey) {
         let url = url(forKey: key)
 
         deleteSafely(url)
     }
 
-    public func getString(forKey key: StorageKey) -> String? {
+    func getString(forKey key: StorageKey) -> String? {
         let value = getJson(forKey: key)
         if let stringValue = value as? String {
             return stringValue
@@ -262,19 +272,19 @@ class PostHogStorage {
         return nil
     }
 
-    public func setString(forKey key: StorageKey, contents: String) {
+    func setString(forKey key: StorageKey, contents: String) {
         setJson(forKey: key, json: contents)
     }
 
-    public func getDictionary(forKey key: StorageKey) -> [AnyHashable: Any]? {
+    func getDictionary(forKey key: StorageKey) -> [AnyHashable: Any]? {
         getJson(forKey: key) as? [AnyHashable: Any]
     }
 
-    public func setDictionary(forKey key: StorageKey, contents: [AnyHashable: Any]) {
+    func setDictionary(forKey key: StorageKey, contents: [AnyHashable: Any]) {
         setJson(forKey: key, json: contents)
     }
 
-    public func getBool(forKey key: StorageKey) -> Bool? {
+    func getBool(forKey key: StorageKey) -> Bool? {
         let value = getJson(forKey: key)
         if let boolValue = value as? Bool {
             return boolValue
@@ -284,7 +294,7 @@ class PostHogStorage {
         return nil
     }
 
-    public func setBool(forKey key: StorageKey, contents: Bool) {
+    func setBool(forKey key: StorageKey, contents: Bool) {
         setJson(forKey: key, json: contents)
     }
 }

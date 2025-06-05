@@ -53,6 +53,26 @@ class PostHogApi {
         return components.url
     }
 
+    private func getRemoteConfigRequest() -> URLRequest? {
+        guard let baseUrl: URL = switch config.host.absoluteString {
+        case "https://us.i.posthog.com":
+            URL(string: "https://us-assets.i.posthog.com")
+        case "https://eu.i.posthog.com":
+            URL(string: "https://eu-assets.i.posthog.com")
+        default:
+            config.host
+        } else {
+            return nil
+        }
+
+        let url = baseUrl.appendingPathComponent("/array/\(config.apiKey)/config")
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.timeoutInterval = defaultTimeout
+        return request
+    }
+
     func batch(events: [PostHogEvent], completion: @escaping (PostHogBatchUploadInfo) -> Void) {
         guard let url = getEndpointURL("/batch", relativeTo: config.host) else {
             hedgeLog("Malformed batch URL error.")
@@ -174,13 +194,13 @@ class PostHogApi {
 
     func decide(
         distinctId: String,
-        anonymousId: String,
+        anonymousId: String?,
         groups: [String: String],
         completion: @escaping ([String: Any]?, _ error: Error?) -> Void
     ) {
         guard let url = getEndpointURL(
             "/decide",
-            queryItems: URLQueryItem(name: "v", value: "3"),
+            queryItems: URLQueryItem(name: "v", value: "4"),
             relativeTo: config.host
         ) else {
             hedgeLog("Malformed decide URL error.")
@@ -191,12 +211,15 @@ class PostHogApi {
 
         let request = getURLRequest(url)
 
-        let toSend: [String: Any] = [
+        var toSend: [String: Any] = [
             "api_key": self.config.apiKey,
             "distinct_id": distinctId,
-            "$anon_distinct_id": anonymousId,
             "$groups": groups,
         ]
+
+        if let anonymousId {
+            toSend["$anon_distinct_id"] = anonymousId
+        }
 
         var data: Data?
 
@@ -235,4 +258,64 @@ class PostHogApi {
             }
         }.resume()
     }
+
+    func remoteConfig(
+        completion: @escaping ([String: Any]?, _ error: Error?) -> Void
+    ) {
+        guard let request = getRemoteConfigRequest() else {
+            hedgeLog("Error calling the remote config API: unable to create request")
+            return
+        }
+
+        let config = sessionConfig()
+
+        let task = URLSession(configuration: config).dataTask(with: request) { data, response, error in
+            if let error {
+                hedgeLog("Error calling the remote config API: \(error.localizedDescription)")
+                return completion(nil, error)
+            }
+
+            let httpResponse = response as! HTTPURLResponse
+
+            if !(200 ... 299 ~= httpResponse.statusCode) {
+                let jsonBody = String(describing: try? JSONSerialization.jsonObject(with: data!, options: .allowFragments) as? [String: Any])
+                let errorMessage = "Error calling the remote config API: status: \(httpResponse.statusCode), body: \(jsonBody)."
+                hedgeLog(errorMessage)
+
+                return completion(nil,
+                                  InternalPostHogError(description: errorMessage))
+            } else {
+                hedgeLog("Remote config called successfully.")
+            }
+
+            do {
+                let jsonData = try JSONSerialization.jsonObject(with: data!, options: .allowFragments) as? [String: Any]
+                completion(jsonData, nil)
+            } catch {
+                hedgeLog("Error parsing the remote config response: \(error)")
+                completion(nil, error)
+            }
+        }
+
+        task.resume()
+    }
+}
+
+extension PostHogApi {
+    static var jsonDecoder: JSONDecoder = {
+        let decoder = JSONDecoder()
+
+        decoder.dateDecodingStrategy = .custom { decoder in
+            let container = try decoder.singleValueContainer()
+            let dateString = try container.decode(String.self)
+            guard let date = apiDateFormatter.date(from: dateString) else {
+                throw DecodingError.dataCorruptedError(
+                    in: container, debugDescription: "Invalid date format"
+                )
+            }
+            return date
+        }
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        return decoder
+    }()
 }
