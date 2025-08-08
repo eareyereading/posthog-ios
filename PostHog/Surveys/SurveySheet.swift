@@ -11,7 +11,7 @@
 
     @available(iOS 15, *)
     struct SurveySheet: View {
-        let survey: PostHogSurvey
+        let survey: PostHogDisplaySurvey
         let isSurveyCompleted: Bool
         let currentQuestionIndex: Int
         let onClose: () -> Void
@@ -40,38 +40,42 @@
                 ConfirmationMessage(onClose: onClose)
             } else if let currentQuestion {
                 switch currentQuestion {
-                case let .open(openSurveyQuestion):
-                    OpenTextQuestionView(question: openSurveyQuestion) { resp in
+                case let currentQuestion as PostHogDisplayOpenQuestion:
+                    OpenTextQuestionView(question: currentQuestion) { resp in
                         onNextQuestionClicked(currentQuestionIndex, .openEnded(resp))
                     }
-                case let .link(linkSurveyQuestion):
-                    LinkQuestionView(question: linkSurveyQuestion) { resp in
+                case let currentQuestion as PostHogDisplayLinkQuestion:
+                    LinkQuestionView(question: currentQuestion) { resp in
                         onNextQuestionClicked(currentQuestionIndex, .link(resp))
                     }
-                case let .rating(ratingSurveyQuestion):
-                    RatingQuestionView(question: ratingSurveyQuestion) { resp in
+                case let currentQuestion as PostHogDisplayRatingQuestion:
+                    RatingQuestionView(question: currentQuestion) { resp in
                         onNextQuestionClicked(currentQuestionIndex, .rating(resp))
                     }
-                case let .singleChoice(multipleSurveyQuestion):
-                    SingleChoiceQuestionView(question: multipleSurveyQuestion) { resp in
-                        onNextQuestionClicked(currentQuestionIndex, .singleChoice(resp))
+                case let currentQuestion as PostHogDisplayChoiceQuestion:
+                    if currentQuestion.isMultipleChoice {
+                        MultipleChoiceQuestionView(question: currentQuestion) { resp in
+                            onNextQuestionClicked(currentQuestionIndex, .multipleChoice(resp))
+                        }
+                    } else {
+                        SingleChoiceQuestionView(question: currentQuestion) { resp in
+                            onNextQuestionClicked(currentQuestionIndex, .singleChoice(resp))
+                        }
                     }
-                case let .multipleChoice(multipleSurveyQuestion):
-                    MultipleChoiceQuestionView(question: multipleSurveyQuestion) { resp in
-                        onNextQuestionClicked(currentQuestionIndex, .multipleChoice(resp))
-                    }
+                default:
+                    EmptyView()
                 }
             }
         }
 
-        private var currentQuestion: PostHogSurveyQuestion? {
+        private var currentQuestion: PostHogDisplaySurveyQuestion? {
             guard currentQuestionIndex <= survey.questions.count - 1 else {
                 return nil
             }
             return survey.questions[currentQuestionIndex]
         }
 
-        private var appearance: SurveyDisplayAppearance {
+        private var appearance: SwiftUISurveyAppearance {
             .getAppearanceWithDefaults(survey.appearance)
         }
     }
@@ -158,41 +162,41 @@
         }
     }
 
-    struct SurveyDisplayAppearance {
-        public var fontFamily: Font
-        public var backgroundColor: Color
-        public var submitButtonColor: Color
-        public var submitButtonText: String
-        public var submitButtonTextColor: Color
-        public var descriptionTextColor: Color
-        public var ratingButtonColor: Color?
-        public var ratingButtonActiveColor: Color?
-        public var displayThankYouMessage: Bool
-        public var thankYouMessageHeader: String
-        public var thankYouMessageDescription: String?
-        public var thankYouMessageDescriptionContentType: PostHogSurveyTextContentType = .text
-        public var thankYouMessageCloseButtonText: String
-        public var borderColor: Color
-        public var placeholder: String?
+    struct SwiftUISurveyAppearance {
+        var fontFamily: Font
+        var backgroundColor: Color
+        var submitButtonColor: Color
+        var submitButtonText: String
+        var submitButtonTextColor: Color
+        var descriptionTextColor: Color
+        var ratingButtonColor: Color?
+        var ratingButtonActiveColor: Color?
+        var displayThankYouMessage: Bool
+        var thankYouMessageHeader: String
+        var thankYouMessageDescription: String?
+        var thankYouMessageDescriptionContentType: PostHogDisplaySurveyTextContentType = .text
+        var thankYouMessageCloseButtonText: String
+        var borderColor: Color
+        var placeholder: String?
     }
 
     @available(iOS 15.0, *)
     private struct SurveyAppearanceEnvironmentKey: EnvironmentKey {
-        static let defaultValue: SurveyDisplayAppearance = .getAppearanceWithDefaults()
+        static let defaultValue: SwiftUISurveyAppearance = .getAppearanceWithDefaults()
     }
 
     extension EnvironmentValues {
         @available(iOS 15.0, *)
-        var surveyAppearance: SurveyDisplayAppearance {
+        var surveyAppearance: SwiftUISurveyAppearance {
             get { self[SurveyAppearanceEnvironmentKey.self] }
             set { self[SurveyAppearanceEnvironmentKey.self] = newValue }
         }
     }
 
-    extension SurveyDisplayAppearance {
+    extension SwiftUISurveyAppearance {
         @available(iOS 15.0, *)
-        static func getAppearanceWithDefaults(_ appearance: PostHogSurveyAppearance? = nil) -> SurveyDisplayAppearance {
-            SurveyDisplayAppearance(
+        static func getAppearanceWithDefaults(_ appearance: PostHogDisplaySurveyAppearance? = nil) -> SwiftUISurveyAppearance {
+            SwiftUISurveyAppearance(
                 fontFamily: Font.customFont(family: appearance?.fontFamily ?? "") ?? Font.body,
                 backgroundColor: colorFrom(css: appearance?.backgroundColor, defaultColor: .tertiarySystemBackground),
                 submitButtonColor: colorFrom(css: appearance?.submitButtonColor, defaultColor: .black),

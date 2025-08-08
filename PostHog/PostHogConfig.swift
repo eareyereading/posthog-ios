@@ -6,6 +6,17 @@
 //
 import Foundation
 
+public typealias BeforeSendBlock = (PostHogEvent) -> PostHogEvent?
+
+@objc public final class BoxedBeforeSendBlock: NSObject {
+    @objc public let block: BeforeSendBlock
+
+    @objc(block:)
+    public init(block: @escaping BeforeSendBlock) {
+        self.block = block
+    }
+}
+
 @objc(PostHogConfig) public class PostHogConfig: NSObject {
     enum Defaults {
         #if os(tvOS)
@@ -66,9 +77,26 @@ import Foundation
 
     /// Hook that allows to sanitize the event properties
     /// The hook is called before the event is cached or sent over the wire
+    @available(*, deprecated, message: "Use beforeSend instead")
     @objc public var propertiesSanitizer: PostHogPropertiesSanitizer?
     /// Determines the behavior for processing user profiles.
     @objc public var personProfiles: PostHogPersonProfiles = .identifiedOnly
+
+    /// Automatically set common device and app properties as person properties for feature flag evaluation.
+    ///
+    /// When enabled, the SDK will automatically set the following person properties:
+    /// - $app_version: App version from bundle
+    /// - $app_build: App build number from bundle
+    /// - $os_name: Operating system name (iOS, macOS, etc.)
+    /// - $os_version: Operating system version
+    /// - $device_type: Device type (Mobile, Tablet, Desktop, etc.)
+    /// - $locale: User's current locale
+    ///
+    /// This helps ensure feature flags that rely on these properties work correctly
+    /// without waiting for server-side processing of identify() calls.
+    ///
+    /// Default: true
+    @objc public var setDefaultPersonProperties: Bool = true
 
     /// The identifier of the App Group that should be used to store shared analytics data.
     /// PostHog will try to get the physical location of the App Group’s shared container, otherwise fallback to the default location
@@ -106,6 +134,17 @@ import Foundation
     @objc public var surveys: Bool {
         get { _surveys }
         set { setSurveys(newValue) }
+    }
+
+    @available(iOS 15.0, *)
+    @available(watchOS, unavailable, message: "Surveys are only available on iOS 15+")
+    @available(macOS, unavailable, message: "Surveys are only available on iOS 15+")
+    @available(tvOS, unavailable, message: "Surveys are only available on iOS 15+")
+    @available(visionOS, unavailable, message: "Surveys are only available on iOS 15+")
+    @_spi(Experimental)
+    @objc public var surveysConfig: PostHogSurveysConfig {
+        get { _surveysConfig }
+        set { setSurveysConfig(newValue) }
     }
 
     // only internal
@@ -170,5 +209,43 @@ import Foundation
         if #available(iOS 15.0, *) {
             _surveys = value
         }
+    }
+
+    var _surveysConfig: PostHogSurveysConfig = .init() // swiftlint:disable:this identifier_name
+    private func setSurveysConfig(_ value: PostHogSurveysConfig) {
+        // protection against objc API availability warning instead of error
+        // Unlike swift, which enforces stricter safety rules, objc just displays a warning
+        if #available(iOS 15.0, *) {
+            _surveysConfig = value
+        }
+    }
+
+    /// Hook that allows to sanitize the event
+    /// The hook is called before the event is cached or sent over the wire
+    private var beforeSend: BeforeSendBlock = { $0 }
+
+    private static func buildBeforeSendBlock(_ blocks: [BeforeSendBlock]) -> BeforeSendBlock {
+        { event in
+            blocks.reduce(event) { event, block in
+                event.flatMap(block)
+            }
+        }
+    }
+
+    public func setBeforeSend(_ blocks: [BeforeSendBlock]) {
+        beforeSend = Self.buildBeforeSendBlock(blocks)
+    }
+
+    public func setBeforeSend(_ blocks: BeforeSendBlock...) {
+        setBeforeSend(blocks)
+    }
+
+    @available(*, unavailable, message: "Use setBeforeSend(_ blocks: BeforeSendBlock...) instead")
+    @objc public func setBeforeSend(_ blocks: [BoxedBeforeSendBlock]) {
+        setBeforeSend(blocks.map(\.block))
+    }
+
+    func runBeforeSend(_ event: PostHogEvent) -> PostHogEvent? {
+        beforeSend(event)
     }
 }

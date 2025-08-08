@@ -11,9 +11,9 @@
 
     @available(iOS 15.0, *)
     final class SurveysWindow: PassthroughWindow {
-        init(surveysManager: SurveyDisplayController, scene: UIWindowScene) {
+        init(controller: SurveyDisplayController, scene: UIWindowScene) {
             super.init(windowScene: scene)
-            let rootView = SurveysRootView().environmentObject(surveysManager)
+            let rootView = SurveysRootView().environmentObject(controller)
             let hostingController = UIHostingController(rootView: rootView)
             hostingController.view.backgroundColor = .clear
             rootViewController = hostingController
@@ -25,7 +25,7 @@
     }
 
     class PassthroughWindow: UIWindow {
-        override public func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+        override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
             guard
                 let hitView = super.hitTest(point, with: event),
                 let rootView = rootViewController?.view

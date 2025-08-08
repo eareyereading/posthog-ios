@@ -13,6 +13,7 @@ class PostHogRemoteConfig {
     private let config: PostHogConfig
     private let storage: PostHogStorage
     private let api: PostHogApi
+    private let getDefaultPersonProperties: () -> [String: Any]
 
     private let loadingFeatureFlagsLock = NSLock()
     private let featureFlagsLock = NSLock()
@@ -29,6 +30,12 @@ class PostHogRemoteConfig {
     private var remoteConfigDidFetch: Bool = false
     private var featureFlagPayloads: [String: Any]?
     private var requestId: String?
+
+    private let personPropertiesForFlagsLock = NSLock()
+    private var personPropertiesForFlags: [String: Any] = [:]
+
+    private let groupPropertiesForFlagsLock = NSLock()
+    private var groupPropertiesForFlags: [String: [String: Any]] = [:]
 
     /// Internal, only used for testing
     var canReloadFlagsForTesting = true
@@ -47,11 +54,16 @@ class PostHogRemoteConfig {
 
     init(_ config: PostHogConfig,
          _ storage: PostHogStorage,
-         _ api: PostHogApi)
+         _ api: PostHogApi,
+         _ getDefaultPersonProperties: @escaping () -> [String: Any])
     {
         self.config = config
         self.storage = storage
         self.api = api
+        self.getDefaultPersonProperties = getDefaultPersonProperties
+
+        // Load cached person and group properties for flags
+        loadCachedPropertiesForFlags()
 
         preloadSessionReplayFlag()
 
@@ -76,15 +88,23 @@ class PostHogRemoteConfig {
                 self.reloadRemoteConfig { [weak self] remoteConfig in
                     guard let self else { return }
 
-                    let hasFeatureFlags = remoteConfig?[self.hasFeatureFlagsKey] as? Bool == true
+                    // if there's no remote config response, skip
+                    guard let remoteConfig else {
+                        hedgeLog("Remote config response is missing, skipping loading flags")
+                        notifyFeatureFlags(nil)
+                        return
+                    }
 
-                    if !hasFeatureFlags {
-                        // if server responds with `hasFeatureFlags: false`, then there are no more active flags on the account
+                    // Check if the server explicitly responded with hasFeatureFlags key
+                    if let hasFeatureFlagsBoolValue = remoteConfig[self.hasFeatureFlagsKey] as? Bool, !hasFeatureFlagsBoolValue {
+                        hedgeLog("hasFeatureFlags is false, clearing flags and skipping loading flags")
+                        // Server responded with explicit hasFeatureFlags: false, meaning no active flags on the account
                         clearFeatureFlags()
                         // need to notify cause people may be waiting for flags to load
                         notifyFeatureFlags([:])
                     } else if self.config.preloadFeatureFlags {
-                        // reload feature flags based on config
+                        // If we reach here, hasFeatureFlags is either true, nil or not a boolean value
+                        // Note: notifyFeatureFlags() will be eventually called inside preloadFeatureFlags()
                         self.preloadFeatureFlags()
                     }
                 }
@@ -157,6 +177,8 @@ class PostHogRemoteConfig {
         }
 
         guard let storageManager = config.storageManager else {
+            hedgeLog("No PostHogStorageManager found in config, skipping loading feature flags")
+            callback?(nil)
             return
         }
 
@@ -241,9 +263,14 @@ class PostHogRemoteConfig {
             self.loadingFeatureFlags = true
         }
 
-        api.decide(distinctId: distinctId,
-                   anonymousId: anonymousId,
-                   groups: groups)
+        let personProperties = getPersonPropertiesForFlags()
+        let groupProperties = getGroupPropertiesForFlags()
+
+        api.flags(distinctId: distinctId,
+                  anonymousId: anonymousId,
+                  groups: groups,
+                  personProperties: personProperties,
+                  groupProperties: groupProperties.isEmpty ? nil : groupProperties)
         { data, _ in
             self.dispatchQueue.async {
                 // Check for quota limitation first
@@ -260,8 +287,8 @@ class PostHogRemoteConfig {
 
                 // Safely handle optional data
                 guard var data = data else {
-                    hedgeLog("Error: Decide response data is nil")
-                    self.notifyFeatureFlagsAndRelease(data)
+                    hedgeLog("Error: Flags response data is nil")
+                    self.notifyFeatureFlagsAndRelease(nil)
                     return callback(nil)
                 }
 
@@ -272,8 +299,8 @@ class PostHogRemoteConfig {
                 guard let featureFlags = data["featureFlags"] as? [String: Any],
                       let featureFlagPayloads = data["featureFlagPayloads"] as? [String: Any]
                 else {
-                    hedgeLog("Error: Decide response missing correct featureFlags format")
-                    self.notifyFeatureFlagsAndRelease(data)
+                    hedgeLog("Error: Flags response missing correct featureFlags format")
+                    self.notifyFeatureFlagsAndRelease(nil)
                     return callback(nil)
                 }
 
@@ -430,6 +457,79 @@ class PostHogRemoteConfig {
             flags = storage.getDictionary(forKey: .flags) as? [String: Any]
         }
         return flags
+    }
+
+    func setPersonPropertiesForFlags(_ properties: [String: Any]) {
+        personPropertiesForFlagsLock.withLock {
+            // Merge properties additively, similar to JS SDK behavior
+            personPropertiesForFlags.merge(properties, uniquingKeysWith: { _, new in new })
+            // Persist to disk
+            storage.setDictionary(forKey: .personPropertiesForFlags, contents: personPropertiesForFlags)
+        }
+    }
+
+    func resetPersonPropertiesForFlags() {
+        personPropertiesForFlagsLock.withLock {
+            personPropertiesForFlags.removeAll()
+            // Clear from disk
+            storage.setDictionary(forKey: .personPropertiesForFlags, contents: personPropertiesForFlags)
+        }
+    }
+
+    func setGroupPropertiesForFlags(_ groupType: String, properties: [String: Any]) {
+        groupPropertiesForFlagsLock.withLock {
+            // Merge properties additively for this group type
+            groupPropertiesForFlags[groupType, default: [:]].merge(properties) { _, new in new }
+            // Persist to disk
+            storage.setDictionary(forKey: .groupPropertiesForFlags, contents: groupPropertiesForFlags)
+        }
+    }
+
+    func resetGroupPropertiesForFlags(_ groupType: String? = nil) {
+        groupPropertiesForFlagsLock.withLock {
+            if let groupType = groupType {
+                groupPropertiesForFlags.removeValue(forKey: groupType)
+            } else {
+                groupPropertiesForFlags.removeAll()
+            }
+            // Persist changes to disk
+            storage.setDictionary(forKey: .groupPropertiesForFlags, contents: groupPropertiesForFlags)
+        }
+    }
+
+    private func getGroupPropertiesForFlags() -> [String: [String: Any]] {
+        groupPropertiesForFlagsLock.withLock {
+            groupPropertiesForFlags
+        }
+    }
+
+    private func getPersonPropertiesForFlags() -> [String: Any] {
+        personPropertiesForFlagsLock.withLock {
+            var properties = personPropertiesForFlags
+
+            // Always include fresh default properties if enabled
+            if config.setDefaultPersonProperties {
+                let defaultProperties = getDefaultPersonProperties()
+                // User-set properties override default properties
+                properties = defaultProperties.merging(properties) { _, userValue in userValue }
+            }
+
+            return properties
+        }
+    }
+
+    private func loadCachedPropertiesForFlags() {
+        personPropertiesForFlagsLock.withLock {
+            if let cachedPersonProperties = storage.getDictionary(forKey: .personPropertiesForFlags) as? [String: Any] {
+                personPropertiesForFlags = cachedPersonProperties
+            }
+        }
+
+        groupPropertiesForFlagsLock.withLock {
+            if let cachedGroupProperties = storage.getDictionary(forKey: .groupPropertiesForFlags) as? [String: [String: Any]] {
+                groupPropertiesForFlags = cachedGroupProperties
+            }
+        }
     }
 
     func getFeatureFlagPayload(_ key: String) -> Any? {

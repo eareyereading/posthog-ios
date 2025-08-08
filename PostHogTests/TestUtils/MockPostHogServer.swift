@@ -16,9 +16,9 @@ import OHHTTPStubsSwift
 class MockPostHogServer {
     var batchRequests = [URLRequest]()
     var batchExpectation: XCTestExpectation?
-    var decideExpectation: XCTestExpectation?
+    var flagsExpectation: XCTestExpectation?
     var batchExpectationCount: Int?
-    var decideRequests = [URLRequest]()
+    var flagsRequests = [URLRequest]()
     var version: Int = 3
 
     func trackBatchRequest(_ request: URLRequest) {
@@ -29,30 +29,30 @@ class MockPostHogServer {
         }
     }
 
-    func trackDecide(_ request: URLRequest) {
-        decideRequests.append(request)
+    func trackFlags(_ request: URLRequest) {
+        flagsRequests.append(request)
 
-        decideExpectation?.fulfill()
+        flagsExpectation?.fulfill()
     }
 
-    public var errorsWhileComputingFlags = false
-    public var return500 = false
-    public var returnReplay = false
-    public var returnReplayWithVariant = false
-    public var returnReplayWithMultiVariant = false
-    public var replayVariantName = "myBooleanRecordingFlag"
-    public var flagsSkipReplayVariantName = false
-    public var replayVariantValue: Any = true
-    public var quotaLimitFeatureFlags: Bool = false
-    public var remoteConfigSurveys: String?
-    public var hasFeatureFlags: Bool = true
-    public var featureFlags: [String: Any]?
+    var errorsWhileComputingFlags = false
+    var return500 = false
+    var returnReplay = false
+    var returnReplayWithVariant = false
+    var returnReplayWithMultiVariant = false
+    var replayVariantName = "myBooleanRecordingFlag"
+    var flagsSkipReplayVariantName = false
+    var replayVariantValue: Any = true
+    var quotaLimitFeatureFlags: Bool = false
+    var remoteConfigSurveys: String?
+    var hasFeatureFlags: Bool? = true
+    var featureFlags: [String: Any]?
 
     // version is the version of the response we want to return regardless of the request version
     init(version: Int = 3) {
         self.version = version
 
-        stub(condition: pathEndsWith("/decide")) { _ in
+        stub(condition: pathEndsWith("/flags")) { _ in
             if self.quotaLimitFeatureFlags {
                 return HTTPStubsResponse(
                     jsonObject: ["quotaLimited": ["feature_flags"]],
@@ -260,6 +260,18 @@ class MockPostHogServer {
         }
 
         stub(condition: pathEndsWith("/config")) { _ in
+            if self.return500 {
+                return HTTPStubsResponse(jsonObject: [], statusCode: 500, headers: nil)
+            }
+
+            // conditionally include hasFeatureFlags key
+            let hasFeatureFlagsPayload: String = {
+                if let hasFeatureFlags = self.hasFeatureFlags {
+                    return "\"hasFeatureFlags\": \(hasFeatureFlags),"
+                }
+                return ""
+            }()
+
             let configData =
                 """
                 {
@@ -268,7 +280,7 @@ class MockPostHogServer {
                         "gzip",
                         "gzip-js"
                     ],
-                    "hasFeatureFlags": \(self.hasFeatureFlags),
+                    \(hasFeatureFlagsPayload)
                     "captureDeadClicks": true,
                     "capturePerformance": {
                         "network_timing": true,
@@ -297,8 +309,8 @@ class MockPostHogServer {
         HTTPStubs.onStubActivation { request, _, _ in
             if request.url?.lastPathComponent == "batch" {
                 self.trackBatchRequest(request)
-            } else if request.url?.lastPathComponent == "decide" {
-                self.trackDecide(request)
+            } else if request.url?.lastPathComponent == "flags" {
+                self.trackFlags(request)
             }
         }
     }
@@ -317,9 +329,9 @@ class MockPostHogServer {
 
     func reset(batchCount: Int = 1) {
         batchRequests = []
-        decideRequests = []
+        flagsRequests = []
         batchExpectation = XCTestExpectation(description: "\(batchCount) batch requests to occur")
-        decideExpectation = XCTestExpectation(description: "1 decide requests to occur")
+        flagsExpectation = XCTestExpectation(description: "1 flag requests to occur")
         batchExpectationCount = batchCount
         errorsWhileComputingFlags = false
         return500 = false
