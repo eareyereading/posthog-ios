@@ -1,5 +1,30 @@
 ## Next
 
+## 3.34.0 - 2025-10-15
+
+- feat: add config option to disable swizzling ([#388](https://github.com/PostHog/posthog-ios/pull/388))
+- feat: SDK instance now manages its own session ([#388](https://github.com/PostHog/posthog-ios/pull/388))
+> **Note**: A potentially breaking change for users with multiple SDK instances. Each SDK instance now manages its own `$session_id` instead of sharing a global session across all instances.
+> This aligns with PostHog JS SDK behavior and ensures proper session isolation when using multiple SDK instances.
+> For single-instance usage (the common case), this change has no impact.
+
+## 3.33.0 - 2025-10-13
+
+- feat: add evaluation tags to iOS SDK ([#387](https://github.com/PostHog/posthog-ios/pull/387))
+
+## 3.32.0 - 2025-10-03
+
+- feat: iOS surveys use the new response question id format ([#383](https://github.com/PostHog/posthog-ios/pull/383))
+
+## 3.31.0 - 2025-08-29
+
+- feat: surveys GA ([#381](https://github.com/PostHog/posthog-ios/pull/381))
+> Note: Surveys are now enabled by default
+
+## 3.30.1 - 2025-08-12
+
+- fix: map missing content type for Surveys ([#377](https://github.com/PostHog/posthog-ios/pull/377))
+
 ## 3.30.0 - 2025-07-28
 
 - feat: add person and group properties for feature flags ([#373](https://github.com/PostHog/posthog-ios/pull/373))
