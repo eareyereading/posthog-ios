@@ -333,6 +333,39 @@ class PostHogSDKTest: QuickSpec {
             sut.close()
         }
 
+        it("force send feature flag event for getFeatureFlag when config disabled") {
+            let sut = self.getSut(preloadFeatureFlags: true, sendFeatureFlagEvent: false)
+
+            waitFlagsRequest(server)
+            expect(sut.getFeatureFlag("bool-value", sendFeatureFlagEvent: true) as? Bool) == true
+
+            let events = getBatchedEvents(server)
+
+            expect(events.count) == 1
+
+            let event = events.first!
+            expect(event.event) == "$feature_flag_called"
+            expect(event.properties["$feature_flag"] as? String) == "bool-value"
+            expect(event.properties["$feature_flag_response"] as? Bool) == true
+
+            sut.reset()
+            sut.close()
+        }
+
+        it("don't send feature flag event for getFeatureFlag when config enabled") {
+            let sut = self.getSut(preloadFeatureFlags: true, sendFeatureFlagEvent: true)
+
+            waitFlagsRequest(server)
+            expect(sut.getFeatureFlag("bool-value", sendFeatureFlagEvent: false) as? Bool) == true
+
+            let events = getBatchedEvents(server, failIfNotCompleted: false)
+
+            expect(events.count) == 0
+
+            sut.reset()
+            sut.close()
+        }
+
         it("reloadFeatureFlags adds groups if any") {
             let sut = self.getSut()
             // group reloads flags when there are new groups
@@ -354,7 +387,7 @@ class PostHogSDKTest: QuickSpec {
             expect(requests.count) == 1
             let request = requests.first
 
-            let groups = request!["$groups"] as? [String: String] ?? [:]
+            let groups = request!["groups"] as? [String: String] ?? [:]
             expect(groups["some-type"]) == "some-key"
 
             sut.reset()
@@ -667,7 +700,7 @@ class PostHogSDKTest: QuickSpec {
             expect(event[1].event).to(equal("force_batch_flush"))
         }
 
-        it("captures $feature_flag_called when getFeatureFlag called twice after reloading flags") {
+        it("does not capture $feature_flag_called again when getFeatureFlag called twice after reloading flags") {
             let sut = self.getSut(
                 sendFeatureFlagEvent: true,
                 flushAt: 2
@@ -678,11 +711,40 @@ class PostHogSDKTest: QuickSpec {
             sut.reloadFeatureFlags {
                 _ = sut.getFeatureFlag("some_key")
             }
+            sut.capture("force_batch_flush")
 
             let event = getBatchedEvents(server)
             expect(event.count).to(equal(2))
             expect(event[0].event).to(equal("$feature_flag_called"))
-            expect(event[1].event).to(equal("$feature_flag_called"))
+            expect(event[1].event).to(equal("force_batch_flush"))
+        }
+
+        it("captures $feature_flag_called again when getFeatureFlag returns different value after reloading flags") {
+            let sut = self.getSut(
+                sendFeatureFlagEvent: true,
+                flushAt: 3
+            )
+
+            // First call gets a false value
+            _ = sut.getFeatureFlag("disabled-flag")
+
+            // Change the mock server to return a different value for the same key
+            server.disabledFlag = true
+
+            sut.reloadFeatureFlags {
+                // Second call gets a true value
+                _ = sut.getFeatureFlag("disabled-flag")
+                sut.capture("force_batch_flush")
+            }
+
+            waitFlagsRequest(server)
+
+            let events = getBatchedEvents(server)
+            expect(events.count).to(equal(3))
+
+            expect(events[0].event).to(equal("$feature_flag_called"))
+            expect(events[1].event).to(equal("$feature_flag_called"))
+            expect(events[2].event).to(equal("force_batch_flush"))
         }
 
         describe("beforeSend hook") {
@@ -906,10 +968,12 @@ class PostHogSDKTest: QuickSpec {
                 // Verify expected default properties are set
                 expect(personProperties["$app_version"]).toNot(beNil())
                 expect(personProperties["$app_build"]).toNot(beNil())
+                expect(personProperties["$app_namespace"]).toNot(beNil())
                 expect(personProperties["$os_name"]).toNot(beNil())
                 expect(personProperties["$os_version"]).toNot(beNil())
                 expect(personProperties["$device_type"]).toNot(beNil())
-                expect(personProperties["$locale"]).toNot(beNil())
+                expect(personProperties["$lib"]).toNot(beNil())
+                expect(personProperties["$lib_version"]).toNot(beNil())
             }
 
             it("does not set default person properties when disabled") {

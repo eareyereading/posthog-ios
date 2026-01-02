@@ -1,5 +1,35 @@
 ## Next
 
+## 3.37.0 - 2025-12-30
+
+- feat: add ability to override sendFeatureFlagEvent for exact feature flag call ([#396](https://github.com/PostHog/posthog-ios/pull/396))
+
+## 3.36.2 - 2025-12-19
+
+- fix: SwiftUI view modifiers .postHogMask() and .postHogNoMask() on iOS 26 ([#415](https://github.com/PostHog/posthog-ios/pull/415))
+
+## 3.36.1 - 2025-12-16
+
+- fix: SwiftUI view masking on iOS 26 ([#409](https://github.com/PostHog/posthog-ios/pull/409))
+> Note: If you are building with Xcode 26, update to this version to fix the SwiftUI view masking issue.
+> Note: Because of the changes of the SwiftUI rendering engine, the SwiftUI modifiers .posthogMask() and .posthogNoMask() may behave inconsistently for SwiftUI primitive views. Use with caution.
+
+## 3.36.0 - 2025-12-08
+
+- feat: include `evaluated_at` properties in `$feature_flag_called` events ([#394](https://github.com/PostHog/posthog-ios/pull/394))
+- fix: only report $feature_flag_called if the flag value has changed ([#405](https://github.com/PostHog/posthog-ios/pull/405))
+
+## 3.35.1 - 2025-12-02
+
+- fix: avoid memory leaks on foat conversions ([#401](https://github.com/PostHog/posthog-ios/pull/401))
+- fix: app group migration now skips identity-related keys from extensions ([#402](https://github.com/PostHog/posthog-ios/pull/402))
+
+## 3.35.0 - 2025-11-07
+
+- fix: call the flags api with the correct groups key name (the api has a back compatible fix already) ([#389](https://github.com/PostHog/posthog-ios/pull/389))
+- fix: only set getDefaultPersonProperties with person properties that are evaluated on the server ([#389](https://github.com/PostHog/posthog-ios/pull/389))
+- feat: set and reset PersonPropertiesForFlags and GroupPropertiesForFlags reload flags automatically (or set reloadFeatureFlags: false) ([#389](https://github.com/PostHog/posthog-ios/pull/389))
+
 ## 3.34.0 - 2025-10-15
 
 - feat: add config option to disable swizzling ([#388](https://github.com/PostHog/posthog-ios/pull/388))
