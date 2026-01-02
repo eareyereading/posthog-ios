@@ -41,7 +41,7 @@ let maxRetryDelay = 30.0
     #if !os(watchOS)
         private var reachability: Reachability?
     #endif
-    private var flagCallReported = Set<String>()
+    private var flagCallReported: [String: [Any?]] = .init()
     private(set) var remoteConfig: PostHogRemoteConfig?
     private var context: PostHogContext?
     private static var apiKeys = Set<String>()
@@ -983,10 +983,28 @@ let maxRetryDelay = 30.0
     /// // Feature flags will now use only server-side properties
     /// let flagValue = PostHogSDK.shared.isFeatureEnabled("feature")
     /// ```
-    ///
-    /// - Note: This method does not automatically reload feature flags. Call `reloadFeatureFlags()`
-    ///         after resetting if you want to immediately refresh flags with the cleared properties.
     @objc public func resetPersonPropertiesForFlags() {
+        resetPersonPropertiesForFlags(reloadFeatureFlags: true)
+    }
+
+    /// Resets all person properties that were set for feature flag evaluation.
+    ///
+    /// After calling this method, feature flag evaluation will only use server-side person properties
+    /// and will not include any locally overridden properties.
+    ///
+    /// ## Example Usage
+    /// ```swift
+    /// // Clear all locally set person properties for flags
+    /// PostHogSDK.shared.resetPersonPropertiesForFlags(reloadFeatureFlags: true)
+    ///
+    /// // Feature flags will now use only server-side properties
+    /// let flagValue = PostHogSDK.shared.isFeatureEnabled("feature")
+    /// ```
+    ///
+    /// - Parameters:
+    ///   - reloadFeatureFlags: Whether to automatically reload feature flags after resetting properties
+    @objc(resetPersonPropertiesForFlagsWithReloadFeatureFlags:)
+    public func resetPersonPropertiesForFlags(reloadFeatureFlags: Bool = true) {
         if !isEnabled() {
             return
         }
@@ -996,6 +1014,10 @@ let maxRetryDelay = 30.0
         }
 
         remoteConfig?.resetPersonPropertiesForFlags()
+
+        if reloadFeatureFlags {
+            remoteConfig?.reloadFeatureFlags()
+        }
     }
 
     /// Sets properties for a specific group type to include when evaluating feature flags.
@@ -1042,7 +1064,7 @@ let maxRetryDelay = 30.0
     ///   - properties: Dictionary of properties to set for this group type
     ///   - reloadFeatureFlags: Whether to automatically reload feature flags after setting properties
     @objc(setGroupPropertiesForFlags:properties:reloadFeatureFlags:)
-    public func setGroupPropertiesForFlags(_ groupType: String, properties: [String: Any], reloadFeatureFlags: Bool) {
+    public func setGroupPropertiesForFlags(_ groupType: String, properties: [String: Any], reloadFeatureFlags: Bool = true) {
         if !isEnabled() {
             return
         }
@@ -1067,11 +1089,20 @@ let maxRetryDelay = 30.0
     /// // Clear all group properties
     /// PostHogSDK.shared.resetGroupPropertiesForFlags()
     /// ```
-    ///
-    /// - Note: This method does not automatically reload feature flags. Call `reloadFeatureFlags()`
-    ///         after resetting if you want to immediately refresh flags with the cleared properties.
     @objc public func resetGroupPropertiesForFlags() {
-        resetGroupPropertiesForFlags(groupType: nil)
+        internalResetGroupPropertiesForFlags(groupType: nil, reloadFeatureFlags: true)
+    }
+
+    /// Clears all group properties for feature flag evaluation.
+    ///
+    /// ## Example Usage
+    /// ```swift
+    /// // Clear all group properties
+    /// PostHogSDK.shared.resetGroupPropertiesForFlags(reloadFeatureFlags: true)
+    /// ```
+    @objc(resetGroupPropertiesForFlagsWithReloadFeatureFlags:)
+    public func resetGroupPropertiesForFlags(reloadFeatureFlags: Bool = true) {
+        internalResetGroupPropertiesForFlags(groupType: nil, reloadFeatureFlags: reloadFeatureFlags)
     }
 
     /// Clears group properties for feature flag evaluation for a specific group type.
@@ -1083,15 +1114,29 @@ let maxRetryDelay = 30.0
     /// ```
     ///
     /// - Parameter groupType: The group type to clear properties for
-    /// - Note: This method does not automatically reload feature flags. Call `reloadFeatureFlags()`
-    ///         after resetting if you want to immediately refresh flags with the cleared properties.
     @objc(resetGroupPropertiesForFlagsWithGroupType:)
     public func resetGroupPropertiesForFlags(_ groupType: String) {
-        resetGroupPropertiesForFlags(groupType: groupType)
+        internalResetGroupPropertiesForFlags(groupType: groupType, reloadFeatureFlags: true)
+    }
+
+    /// Clears group properties for feature flag evaluation for a specific group type.
+    ///
+    /// ## Example Usage
+    /// ```swift
+    /// // Clear properties for specific group type
+    /// PostHogSDK.shared.resetGroupPropertiesForFlags("organization", reloadFeatureFlags: true)
+    /// ```
+    ///
+    /// - Parameters:
+    ///   - groupType: The group type to clear properties for
+    ///   - reloadFeatureFlags: Whether to automatically reload feature flags after setting properties
+    @objc(resetGroupPropertiesForFlagsWithGroupType:reloadFeatureFlags:)
+    public func resetGroupPropertiesForFlags(_ groupType: String, reloadFeatureFlags: Bool = true) {
+        internalResetGroupPropertiesForFlags(groupType: groupType, reloadFeatureFlags: reloadFeatureFlags)
     }
 
     /// Internal implementation for resetting group properties.
-    private func resetGroupPropertiesForFlags(groupType: String?) {
+    private func internalResetGroupPropertiesForFlags(groupType: String?, reloadFeatureFlags: Bool) {
         if !isEnabled() {
             return
         }
@@ -1101,6 +1146,10 @@ let maxRetryDelay = 30.0
         }
 
         remoteConfig?.resetGroupPropertiesForFlags(groupType)
+
+        if reloadFeatureFlags {
+            remoteConfig?.reloadFeatureFlags()
+        }
     }
 
     @objc public func reloadFeatureFlags() {
@@ -1116,14 +1165,20 @@ let maxRetryDelay = 30.0
         }
 
         remoteConfig?.reloadFeatureFlags { _ in
-            self.flagCallReportedLock.withLock {
-                self.flagCallReported.removeAll()
-            }
             callback()
         }
     }
 
     @objc public func getFeatureFlag(_ key: String) -> Any? {
+        getFeatureFlag(key, sendEvent: nil)
+    }
+
+    @objc(getFeatureFlagWithKey:sendFeatureFlagEvent:)
+    public func getFeatureFlag(_ key: String, sendFeatureFlagEvent: Bool) -> Any? {
+        getFeatureFlag(key, sendEvent: sendFeatureFlagEvent)
+    }
+
+    private func getFeatureFlag(_ key: String, sendEvent sendFeatureFlagEvent: Bool? = nil) -> Any? {
         if !isEnabled() {
             return nil
         }
@@ -1134,7 +1189,8 @@ let maxRetryDelay = 30.0
 
         let value = remoteConfig.getFeatureFlag(key)
 
-        if config.sendFeatureFlagEvent {
+        let shouldSendEvent = sendFeatureFlagEvent ?? config.sendFeatureFlagEvent
+        if shouldSendEvent {
             reportFeatureFlagCalled(flagKey: key, flagValue: value)
         }
 
@@ -1142,7 +1198,16 @@ let maxRetryDelay = 30.0
     }
 
     @objc public func isFeatureEnabled(_ key: String) -> Bool {
-        let result = getFeatureFlag(key)
+        isFeatureEnabled(key, sendEvent: nil)
+    }
+
+    @objc(isFeatureEnabledWithKey:sendFeatureFlagEvent:)
+    public func isFeatureEnabled(_ key: String, sendFeatureFlagEvent: Bool) -> Bool {
+        isFeatureEnabled(key, sendEvent: sendFeatureFlagEvent)
+    }
+
+    private func isFeatureEnabled(_ key: String, sendEvent: Bool? = nil) -> Bool {
+        let result = getFeatureFlag(key, sendEvent: sendEvent)
         return result is String ? true : (result as? Bool) ?? false
     }
 
@@ -1158,25 +1223,52 @@ let maxRetryDelay = 30.0
         return remoteConfig.getFeatureFlagPayload(key)
     }
 
+    private func flagValuesEqual(_ lhs: Any?, _ rhs: Any?) -> Bool {
+        switch (lhs, rhs) {
+        case (nil, nil):
+            return true
+        case let (boolValue as Bool, flagBoolValue as Bool):
+            return boolValue == flagBoolValue
+        case let (stringValue as String, flagStringValue as String):
+            return stringValue == flagStringValue
+        default:
+            return false
+        }
+    }
+
     private func reportFeatureFlagCalled(flagKey: String, flagValue: Any?) {
-        var shouldCapture = false
+        var shouldCapture = true
 
         flagCallReportedLock.withLock {
-            if !flagCallReported.contains(flagKey) {
-                flagCallReported.insert(flagKey)
-                shouldCapture = true
+            var values = flagCallReported[flagKey] ?? []
+
+            for value in values {
+                if flagValuesEqual(value, flagValue) {
+                    shouldCapture = false
+                    break
+                }
+            }
+
+            if shouldCapture {
+                values.append(flagValue)
+                flagCallReported[flagKey] = values
             }
         }
 
         if shouldCapture {
             let requestId = remoteConfig?.lastRequestId ?? ""
+            let evaluatedAt = remoteConfig?.lastEvaluatedAt
             let details = remoteConfig?.getFeatureFlagDetails(flagKey)
 
-            var properties = [
+            var properties: [String: Any] = [
                 "$feature_flag": flagKey,
                 "$feature_flag_response": flagValue ?? NSNull(),
                 "$feature_flag_request_id": requestId,
             ]
+
+            if let evaluatedAt {
+                properties["$feature_flag_evaluated_at"] = evaluatedAt
+            }
 
             if let details = details as? [String: Any] {
                 if let reason = details["reason"] as? [String: Any] {
