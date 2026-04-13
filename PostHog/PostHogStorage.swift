@@ -72,7 +72,9 @@ func getBundleIdentifier() -> String {
     #if TESTING // only visible to test targets
         return Bundle.main.bundleIdentifier ?? "com.posthog.test"
     #else
-        return Bundle.main.bundleIdentifier!
+        // Can be nil for command-line tools, XCTest hosts, Swift Playgrounds etc
+        // Should theoretically never be nil for a shipping app
+        return Bundle.main.bundleIdentifier ?? "com.posthog.unknown"
     #endif
 }
 
@@ -227,8 +229,9 @@ class PostHogStorage {
     enum StorageKey: String, CaseIterable {
         case distinctId = "posthog.distinctId"
         case anonymousId = "posthog.anonymousId"
-        case queue = "posthog.queueFolder" // NOTE: This is different to posthog-ios v2
-        case oldQeueue = "posthog.queue.plist"
+        case queue = "posthog.queueFolder.uuid" // queue from > 3.48.1
+        case oldQueueFolder = "posthog.queueFolder" // queue from 3.0.0 - 3.48.1
+        case oldQueuePlist = "posthog.queue.plist" // queue from pre-3.0.0
         case replayQeueue = "posthog.replayFolder"
         case enabledFeatureFlags = "posthog.enabledFeatureFlags"
         case enabledFeatureFlagPayloads = "posthog.enabledFeatureFlagPayloads"
@@ -241,10 +244,12 @@ class PostHogStorage {
         case personProcessingEnabled = "posthog.enabledPersonProcessing"
         case remoteConfig = "posthog.remoteConfig"
         case surveySeen = "posthog.surveySeen"
+        case lastSeenSurveyDate = "posthog.lastSeenSurveyDate"
         case requestId = "posthog.requestId"
         case evaluatedAt = "posthog.evaluatedAt"
         case personPropertiesForFlags = "posthog.personPropertiesForFlags"
         case groupPropertiesForFlags = "posthog.groupPropertiesForFlags"
+        case errorTracking = "posthog.errorTracking"
     }
 
     // The location for storing data that we always want to keep
@@ -389,7 +394,8 @@ class PostHogStorage {
             deleteSafely(url(forKey: .anonymousId))
         }
         // .queue, .replayQeueue not needed since it'll be deleted by the queue.clear()
-        deleteSafely(url(forKey: .oldQeueue))
+        deleteSafely(url(forKey: .oldQueueFolder))
+        deleteSafely(url(forKey: .oldQueuePlist))
         deleteSafely(url(forKey: .flags))
         deleteSafely(url(forKey: .enabledFeatureFlags))
         deleteSafely(url(forKey: .enabledFeatureFlagPayloads))
@@ -401,9 +407,11 @@ class PostHogStorage {
         deleteSafely(url(forKey: .personProcessingEnabled))
         deleteSafely(url(forKey: .remoteConfig))
         deleteSafely(url(forKey: .surveySeen))
+        deleteSafely(url(forKey: .lastSeenSurveyDate))
         deleteSafely(url(forKey: .requestId))
         deleteSafely(url(forKey: .personPropertiesForFlags))
         deleteSafely(url(forKey: .groupPropertiesForFlags))
+        deleteSafely(url(forKey: .errorTracking))
     }
 
     func remove(key: StorageKey) {

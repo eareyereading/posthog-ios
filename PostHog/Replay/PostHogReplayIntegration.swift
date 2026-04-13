@@ -29,11 +29,19 @@
 
         private let windowViewsLock = NSLock()
         private let windowViews = NSMapTable<UIWindow, ViewTreeSnapshotStatus>.weakToStrongObjects()
+        private let installedPluginsLock = NSLock()
         private var applicationEventToken: RegistrationToken?
         private var applicationBackgroundedToken: RegistrationToken?
         private var applicationForegroundedToken: RegistrationToken?
         private var viewLayoutToken: RegistrationToken?
+        private var remoteConfigLoadedToken: RegistrationToken?
+        private var sessionIdChangedToken: RegistrationToken?
+        private var eventCapturedToken: RegistrationToken?
         private var installedPlugins: [PostHogSessionReplayPlugin] = []
+
+        private let eventTriggersLock = NSLock()
+        private var eventTriggers: [String]?
+        private var triggerActivatedSessionId: String?
 
         /**
          ### Mapping of SwiftUI Views to UIKit (up until iOS 18)
@@ -136,12 +144,30 @@
 
             self.postHog = postHog
 
+            // Resolve event triggers from cached remote config (if available)
+            if let cachedRemoteConfig = postHog.remoteConfig?.getRemoteConfig() {
+                updateEventTriggers(from: cachedRemoteConfig)
+            }
+
+            // Subscribe to remote config changes (needed before start to update triggers)
+            remoteConfigLoadedToken = postHog.remoteConfig?.onRemoteConfigLoaded.subscribe { [weak self] config in
+                self?.applyRemoteConfig(remoteConfig: config)
+            }
+
+            // Subscribe to event captures for trigger matching (needed before start to detect triggers)
+            eventCapturedToken = postHog.onEventCaptured.subscribe { [weak self] event in
+                self?.handleEventCaptured(event: event.event)
+            }
+
             start()
         }
 
         func uninstall(_ postHog: PostHogSDK) {
             if self.postHog === postHog || self.postHog == nil {
                 stop()
+                // Clear the pre-start listeners
+                remoteConfigLoadedToken = nil
+                eventCapturedToken = nil
                 self.postHog = nil
                 PostHogReplayIntegration.integrationInstalledLock.withLock {
                     PostHogReplayIntegration.integrationInstalled = false
@@ -149,21 +175,55 @@
             }
         }
 
+        /// Returns true if event triggers are configured and the current session has not been activated yet.
+        private func shouldWaitForEventTriggers() -> Bool {
+            guard let postHog else { return false }
+
+            guard let currentSessionId = postHog.sessionManager.getSessionId(readOnly: true) else {
+                return false
+            }
+
+            let (triggers, activatedSession) = eventTriggersLock.withLock {
+                (eventTriggers, triggerActivatedSessionId)
+            }
+
+            guard let triggers = triggers, !triggers.isEmpty else {
+                return false
+            }
+
+            // Wait if this session has not been activated yet
+            return activatedSession != currentSessionId
+        }
+
+        /// Starts session replay recording.
         func start() {
-            guard let postHog, !isEnabled else {
+            guard let postHog, !isEnabled else { return }
+
+            // Check if we should wait for event triggers before starting
+            if shouldWaitForEventTriggers() {
+                let triggers = eventTriggersLock.withLock { eventTriggers } ?? []
+                hedgeLog("[Session Replay] Event triggers configured. Integration will not start until any of these events are captured: \(triggers)")
+                return
+            }
+
+            // Check sampling before starting timers and listeners
+            if let sessionId = postHog.sessionManager.getSessionId(readOnly: true),
+               !shouldRecordSession(postHog: postHog, sessionId: sessionId)
+            {
+                hedgeLog("[Session Replay] Session \(sessionId) not sampled for recording. Skipping start.")
                 return
             }
 
             isEnabled = true
-            // reset views when session id changes (or is cleared) so we can re-send new metadata (or full snapshot in the future)
-            postHog.sessionManager.onSessionIdChanged = { [weak self] in
-                self?.resetViews()
+            // Listen for session changes to stop recording when a new session starts (if triggers are configured)
+            sessionIdChangedToken = postHog.sessionManager.onSessionIdChanged.subscribe { [weak self] in
+                self?.handleSessionChanged()
             }
 
             // flutter captures snapshots, so we don't need to capture them here
             if isNotFlutter() {
                 let interval = postHog.config.sessionReplayConfig.throttleDelay
-                viewLayoutToken = DI.main.viewLayoutPublisher.onViewLayout(throttle: interval) { [weak self] in
+                viewLayoutToken = DI.main.viewLayoutPublisher.onViewLayout.subscribe(throttle: interval) { [weak self] in
                     // called on main thread
                     self?.snapshot()
                 }
@@ -171,35 +231,51 @@
 
             // start listening to `UIApplication.sendEvent`
             let applicationEventPublisher = DI.main.applicationEventPublisher
-            applicationEventToken = applicationEventPublisher.onApplicationEvent { [weak self] event, date in
+            applicationEventToken = applicationEventPublisher.onApplicationEvent.subscribe { [weak self] event, date in
                 self?.handleApplicationEvent(event: event, date: date)
             }
 
             // Install plugins
-            let plugins = postHog.config.sessionReplayConfig.getPlugins()
-            installedPlugins = []
-            for plugin in plugins {
+            let pluginTypes = postHog.config.sessionReplayConfig.getPluginTypes()
+            let remoteConfig = postHog.remoteConfig?.getRemoteConfig()
+            let pluginsToStart = installedPluginsLock.withLock {
+                installedPlugins = []
+                for pluginType in pluginTypes {
+                    if !pluginType.isEnabledRemotely(remoteConfig: remoteConfig) {
+                        hedgeLog("[Session Replay] Plugin \(pluginType) skipped - disabled by cached remote config")
+                        continue
+                    }
+                    let plugin = pluginType.init()
+                    installedPlugins.append(plugin)
+                }
+                return installedPlugins
+            }
+
+            for plugin in pluginsToStart {
                 plugin.start(postHog: postHog)
-                installedPlugins.append(plugin)
             }
 
             // Start listening to application background events and pause all plugins
             let applicationLifecyclePublisher = DI.main.appLifecyclePublisher
-            applicationBackgroundedToken = applicationLifecyclePublisher.onDidEnterBackground { [weak self] in
+            applicationBackgroundedToken = applicationLifecyclePublisher.onDidEnterBackground.subscribe { [weak self] in
                 self?.pauseAllPlugins()
             }
 
             // Start listening to application foreground events and resume all plugins
-            applicationForegroundedToken = applicationLifecyclePublisher.onDidBecomeActive { [weak self] in
+            applicationForegroundedToken = applicationLifecyclePublisher.onDidBecomeActive.subscribe { [weak self] in
                 self?.resumeAllPlugins()
             }
+
+            hedgeLog("Session replay recording started.")
         }
 
+        /// Stops session replay recording.
+        /// Note: This does not clear remoteConfigLoadedToken or eventCapturedToken as those are managed by install/uninstall.
         func stop() {
             guard isEnabled else { return }
             isEnabled = false
             resetViews()
-            postHog?.sessionManager.onSessionIdChanged = {}
+            sessionIdChangedToken = nil
 
             // stop listening to `UIApplication.sendEvent`
             applicationEventToken = nil
@@ -208,12 +284,17 @@
             applicationForegroundedToken = nil
             // stop listening to `UIView.layoutSubviews` events
             viewLayoutToken = nil
-
             // stop plugins
-            for plugin in installedPlugins {
+            let pluginsToStop = installedPluginsLock.withLock {
+                defer { installedPlugins = [] }
+                return installedPlugins
+            }
+
+            for plugin in pluginsToStop {
                 plugin.stop()
             }
-            installedPlugins = []
+
+            hedgeLog("Session replay recording stopped.")
         }
 
         func isActive() -> Bool {
@@ -227,16 +308,86 @@
             }
         }
 
+        /// Determines whether the given session should be recorded based on sample rate configuration.
+        /// Local config sample rate takes precedence over remote config.
+        /// Returns `true` if no sample rate is configured (record everything).
+        private func shouldRecordSession(postHog: PostHogSDK, sessionId: String) -> Bool {
+            let localSampleRate = postHog.config.sessionReplayConfig.sampleRate?.doubleValue
+            let remoteSampleRate = postHog.remoteConfig?.getRecordingSampleRate()
+
+            guard let sampleRate = localSampleRate ?? remoteSampleRate else {
+                return true
+            }
+
+            return sampleOnProperty(sessionId, sampleRate)
+        }
+
+        private func reevaluateSampling() {
+            guard let postHog else { return }
+
+            guard let sessionId = postHog.sessionManager.getSessionId(readOnly: true) else {
+                return
+            }
+
+            let sampled = shouldRecordSession(postHog: postHog, sessionId: sessionId)
+
+            if sampled, !isEnabled {
+                hedgeLog("[Session Replay] Session \(sessionId) sampled for recording. Starting.")
+                start()
+            } else if !sampled, isEnabled {
+                hedgeLog("[Session Replay] Session \(sessionId) not sampled for recording. Stopping.")
+                stop()
+            }
+        }
+
+        /// Called when session ID changes. Handles view reset, sampling re-evaluation,
+        /// and trigger state management.
+        private func handleSessionChanged() {
+            guard let postHog else { return }
+
+            guard let currentSessionId = postHog.sessionManager.getSessionId(readOnly: true) else {
+                return
+            }
+
+            // Always reset views on session change
+            if isEnabled {
+                resetViews()
+            }
+
+            let (triggers, activatedSession) = eventTriggersLock.withLock {
+                (eventTriggers, triggerActivatedSessionId)
+            }
+
+            // If triggers are configured and this session hasn't been activated, stop the integration
+            if let triggers = triggers, !triggers.isEmpty, activatedSession != currentSessionId {
+                if isEnabled {
+                    hedgeLog("[Session Replay] New session \(currentSessionId), stopping until event trigger is matched")
+                    stop()
+                }
+                return
+            }
+
+            // Re-evaluate sampling for the new session
+            reevaluateSampling()
+        }
+
         private func pauseAllPlugins() {
-            for plugin in installedPlugins {
+            let pluginsToPause = installedPluginsLock.withLock { installedPlugins }
+            for plugin in pluginsToPause {
                 plugin.pause()
             }
         }
 
         private func resumeAllPlugins() {
-            for plugin in installedPlugins {
+            let pluginsToResume = installedPluginsLock.withLock { installedPlugins }
+            for plugin in pluginsToResume {
                 plugin.resume()
             }
+        }
+
+        func applyRemoteConfig(remoteConfig: [String: Any]?) {
+            updatePlugins(from: remoteConfig)
+            updateEventTriggers(from: remoteConfig)
         }
 
         private func handleApplicationEvent(event: UIEvent, date: Date) {
@@ -316,7 +467,9 @@
         private func generateSnapshot(_ window: UIWindow, _ screenName: String? = nil, postHog: PostHogSDK) {
             var hasChanges = false
 
-            guard let wireframe = postHog.config.sessionReplayConfig.screenshotMode ? toScreenshotWireframe(window) : toWireframe(window) else {
+            guard let wireframe = autoreleasepool(invoking: {
+                postHog.config.sessionReplayConfig.screenshotMode ? toScreenshotWireframe(window) : toWireframe(window)
+            }) else {
                 return
             }
 
@@ -361,8 +514,12 @@
                     return
                 }
 
+                let wireframeDict = autoreleasepool { wireframe.toDict() }
+                wireframe.image = nil
+                wireframe.maskableWidgets = nil
+
                 var wireframes: [Any] = []
-                wireframes.append(wireframe.toDict())
+                wireframes.append(wireframeDict)
                 let initialOffset = ["top": 0, "left": 0]
                 let data: [String: Any] = ["initialOffset": initialOffset, "wireframes": wireframes]
                 let snapshotData: [String: Any] = ["type": 2, "data": data, "timestamp": timestamp]
@@ -910,6 +1067,109 @@
             // this cannot run off of the main thread because most properties require to be called within the main thread
             // this method has to be fast and do as little as possible
             generateSnapshot(window, screenName, postHog: postHog)
+        }
+
+        private func handleEventCaptured(event: String) {
+            guard let postHog else { return }
+
+            guard let currentSessionId = postHog.sessionManager.getSessionId(readOnly: true) else {
+                return
+            }
+
+            let (triggers, activatedSession) = eventTriggersLock.withLock {
+                (eventTriggers, triggerActivatedSessionId)
+            }
+
+            guard let triggers = triggers, !triggers.isEmpty else {
+                return
+            }
+
+            // Check if this session has already been activated
+            guard activatedSession != currentSessionId else {
+                return
+            }
+
+            if triggers.contains(event) {
+                eventTriggersLock.withLock {
+                    triggerActivatedSessionId = currentSessionId
+                }
+                hedgeLog("[Session Replay] Event trigger matched: \(event). Starting replay for session \(currentSessionId).")
+                // Start the integration now that a trigger has matched
+                start()
+            }
+        }
+
+        /// Resolves event triggers from remote config payload.
+        private func updateEventTriggers(from remoteConfig: [String: Any]?) {
+            // Parse event triggers from remote config
+            // Path: sessionRecording.eventTriggers ([String])
+            let remoteEventTriggers: [String]? = {
+                guard let sessionRecording = remoteConfig?["sessionRecording"] as? [String: Any],
+                      let triggers = sessionRecording["eventTriggers"] as? [String]
+                else {
+                    return nil
+                }
+                return triggers
+            }()
+
+            let previousTriggers = eventTriggersLock.withLock {
+                let prev = eventTriggers
+                eventTriggers = remoteEventTriggers
+                // Clear activated session when triggers change
+                triggerActivatedSessionId = nil
+                return prev
+            }
+
+            // If triggers were added/changed and integration is running, stop it
+            if let newTriggers = remoteEventTriggers, !newTriggers.isEmpty {
+                if isEnabled {
+                    hedgeLog("[Session Replay] Event triggers updated. Stopping until trigger is matched.")
+                    stop()
+                }
+            } else if previousTriggers != nil, !previousTriggers!.isEmpty, remoteEventTriggers?.isEmpty != false {
+                // Triggers were removed - start if not already running and sampling allows
+                if !isEnabled {
+                    hedgeLog("[Session Replay] Event triggers removed. Starting replay.")
+                    start()
+                }
+            }
+        }
+
+        /// Updates plugin enablement based on remote config.
+        private func updatePlugins(from remoteConfig: [String: Any]?) {
+            guard let postHog else { return }
+
+            let allPluginTypes = postHog.config.sessionReplayConfig.getPluginTypes()
+
+            var pluginsToStop: [PostHogSessionReplayPlugin] = []
+            var pluginsToStart: [PostHogSessionReplayPlugin] = []
+
+            installedPluginsLock.withLock {
+                for pluginType in allPluginTypes {
+                    let isEnabled = pluginType.isEnabledRemotely(remoteConfig: remoteConfig)
+                    let installedIndex = installedPlugins.firstIndex { type(of: $0) == pluginType }
+
+                    if let index = installedIndex, !isEnabled {
+                        // Installed, but disabled in remote
+                        pluginsToStop.append(installedPlugins[index])
+                        installedPlugins.remove(at: index)
+                    } else if installedIndex == nil, isEnabled {
+                        // Not installed, but enabled in remote
+                        let plugin = pluginType.init()
+                        installedPlugins.append(plugin)
+                        pluginsToStart.append(plugin)
+                    }
+                }
+            }
+
+            for plugin in pluginsToStop {
+                plugin.stop()
+                hedgeLog("[Session Replay] Plugin \(type(of: plugin)) uninstalled - disabled by remote config")
+            }
+            for plugin in pluginsToStart {
+                plugin.start(postHog: postHog)
+                hedgeLog("[Session Replay] Plugin \(type(of: plugin)) installed - enabled by remote config")
+            }
         }
     }
 

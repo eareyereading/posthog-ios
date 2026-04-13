@@ -56,7 +56,7 @@ class PostHogQueue {
 
             switch endpoint {
             case .batch:
-                fileQueue = PostHogFileBackedQueue(queue: storage.url(forKey: .queue), oldQueue: storage.url(forKey: .oldQeueue))
+                fileQueue = PostHogFileBackedQueue(queue: storage.url(forKey: .queue), oldQueues: [storage.url(forKey: .oldQueueFolder), storage.url(forKey: .oldQueuePlist)])
                 dispatchQueue = DispatchQueue(label: "com.posthog.Queue", target: .global(qos: .utility))
             case .snapshot:
                 fileQueue = PostHogFileBackedQueue(queue: storage.url(forKey: .replayQeueue))
@@ -71,7 +71,7 @@ class PostHogQueue {
 
             switch endpoint {
             case .batch:
-                fileQueue = PostHogFileBackedQueue(queue: storage.url(forKey: .queue), oldQueue: storage.url(forKey: .oldQeueue))
+                fileQueue = PostHogFileBackedQueue(queue: storage.url(forKey: .queue), oldQueues: [storage.url(forKey: .oldQueueFolder), storage.url(forKey: .oldQueuePlist)])
                 dispatchQueue = DispatchQueue(label: "com.posthog.Queue", target: .global(qos: .utility))
             case .snapshot:
                 fileQueue = PostHogFileBackedQueue(queue: storage.url(forKey: .replayQeueue))
@@ -211,15 +211,12 @@ class PostHogQueue {
             fileQueue.delete(index: 0)
         }
 
-        var data: Data?
-        do {
-            data = try JSONSerialization.data(withJSONObject: event.toJSON())
-        } catch {
-            hedgeLog("Tried to queue unserialisable PostHogEvent \(error)")
+        guard let data = toJSONData(event.toJSON()) else {
+            hedgeLog("Tried to queue unserialisable PostHogEvent")
             return
         }
 
-        fileQueue.add(data!)
+        fileQueue.add(data)
         hedgeLog("Queued event '\(event.event)'. Depth: \(fileQueue.depth)")
         flushIfOverThreshold()
     }
@@ -274,9 +271,9 @@ class PostHogQueue {
             return false
         }
 
-        if pausedUntil != nil, pausedUntil! > Date() {
+        if let pausedUntil, pausedUntil > Date() {
             // We don't flush data if the queue is temporarily paused
-            hedgeLog("The queue is paused until `\(pausedUntil!)`")
+            hedgeLog("The queue is paused until `\(pausedUntil)`")
             return false
         }
 
