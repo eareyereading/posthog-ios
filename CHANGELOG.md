@@ -1,23 +1,159 @@
 ## Next
 
+## 3.50.0
+
+### Minor Changes
+
+- 569348a: feat: error tracking GA
+
+## 3.49.1
+
+### Patch Changes
+
+- 642d4b1: correct frame addresses, ordering, and in-app detection
+
+## 3.49.0
+
+### Minor Changes
+
+- c2a3963: feat: Manual capture deep link events (SwiftUI and UIKit). Thanks @jeremiahseun ❤️
+
+## 3.48.4
+
+### Patch Changes
+
+- 8bdd623: fix: session replay memory leak with 1s screenshot throttling
+- 5055fd7: fix: SPM builds on Mac Catalyst build error
+
+## 3.48.3
+
+### Patch Changes
+
+- 9d48e58: fix: use separate queue folder to prevent crashes when downgrading from 3.48.1+ to older SDK versions
+
+## 3.48.2
+
+### Patch Changes
+
+- e331f56: purge crash reports before processing them
+
+## 3.48.1
+
+### Patch Changes
+
+- 3545320: fix: guard swizzled layoutSublayers to handle background thread calls
+- 061cb44: Replace ReadWriteLock with NSLock for consistent thread-safety across the codebase. The ReadWriteLock property wrapper provided false thread-safety for collection types since the lock was released between separate operations. Using explicit NSLock with `.withLock` closures ensures atomic operations and clearer intent.
+- ac76d70: fix: clear in-memory feature flags cache on reset()
+
+## 3.48.0
+
+### Minor Changes
+
+- 80f39ca: feat: add support for session replay event triggers
+
+## 3.47.0
+
+### Minor Changes
+
+- 8f44e92: feat: Add `captureFeatureView` and `captureFeatureInteraction` methods for tracking feature flag analytics
+- a9366ad: support survey event property filters
+
+## 3.46.0
+
+### Minor Changes
+
+- 1f987f4: Add ObjC convenience overloads for captureException methods without requiring properties parameter
+- 20ba9dc: Flush event queue when the app enters background to ensure pending events are sent before the app is suspended
+- 6f65947: Capture `$feature_flag_called` event when session replay is gated behind a linked feature flag
+
+## 3.45.2
+
+### Patch Changes
+
+- ff6c2ab: Skip dSYM upload for non-Release builds to avoid unnecessary network work and build failures during local development
+
+## 3.45.1
+
+### Patch Changes
+
+- d6e54f1: fix: process pending crash reports
+
+## 3.45.0
+
+### Minor Changes
+
+- 33fe226: feat: add experimental error tracking support
+
+## 3.44.0
+
+### Minor Changes
+
+- cbd7024: support survey wait period
+
+## 3.43.0
+
+### Minor Changes
+
+- d85e393: feat: support 'always' survey schedule
+
+### Patch Changes
+
+- 4a8496c: fix: queue pending feature flags reload instead of dropping concurrent requests
+
+## 3.42.1
+
+### Patch Changes
+
+- 59befaf: Use remote config as sole config loading mechanism: remove `config=true` from flags endpoint, add `timezone` to flags requests, deprecate `remoteConfig` config option
+
+## 3.42.0
+
+### Minor Changes
+
+- 5df2c40: feat: Support session recording `sampleRate` from remote config
+
+## 3.41.2
+
+### Patch Changes
+
+- 9b67e4c: test new release process
+
+## 3.41.1 - 2026-02-12
+
+fix: Session Replay now correctly checks the `network_timing` flag in remote config when `capturePerformance` is an object ([#470](https://github.com/PostHog/posthog-ios/pull/470))
+
+## 3.41.0 - 2026-02-10
+
+- feat: session replay config `sessionReplayConfig.captureLogs` and `sessionReplayConfig.captureNetworkTelemetry` now respect project settings ([#452](https://github.com/PostHog/posthog-ios/pull/452))
+  > **Note**: requires `PostHogConfig.remoteConfig` to be enabled (default)
+- fix: prevent crashes from non JSON-serializable property types (Date, URL, Data, infinity, NaN, etc.) ([#466](https://github.com/PostHog/posthog-ios/pull/466))
+- feat: add `$is_testflight` and `$is_sideloaded` event properties ([#443](https://github.com/PostHog/posthog-ios/pull/443))
+
+## 3.40.0 - 2026-02-05
+
+> ⚠️ **Warning**: This version contains a crash when using `setPersonProperties` with non-JSON-serializable types like `Date` in properties. Please upgrade to the next version.
+
+- feat: Add `getFeatureFlagResult` method to client ([#455](https://github.com/PostHog/posthog-ios/pull/455))
+
+## 3.39.0 - 2026-02-03
+
 - feat: add `setPersonProperties` method to update person profile properties ([#441](https://github.com/PostHog/posthog-ios/pull/441))
 - fix: do not capture $set events if user props have not changed ([#441](https://github.com/PostHog/posthog-ios/pull/441))
 
 ## 3.38.0 - 2026-01-22
 
 - chore: support new surveys color options for ios+flutter ([#440](https://github.com/PostHog/posthog-ios/pull/440))
-
 - feat: support thumbs up/down surveys for ios ([#437](https://github.com/PostHog/posthog-ios/pull/437))
-
 - fix: Retain cached flags when quota limited ([#438](https://github.com/PostHog/posthog-ios/pull/438))
-
 - Renamed `evaluationEnvironments` to `evaluationContexts` for clearer semantics ([#434](https://github.com/PostHog/posthog-ios/pull/434)). The term "contexts" better reflects that this feature is for specifying evaluation contexts (e.g., "web", "mobile", "checkout") rather than deployment environments (e.g., "staging", "production").
 - The API now sends `evaluation_contexts` instead of `evaluation_environments` to the server.
 
 ### Deprecated
+
 - `PostHogConfig.evaluationEnvironments` is now deprecated in favor of `PostHogConfig.evaluationContexts`. The old property will continue to work and will print a deprecation warning. It will be removed in a future major version.
 
 ### Migration Guide
+
 ```swift
 // Before
 config.evaluationEnvironments = ["production", "web", "checkout"]

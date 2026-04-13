@@ -47,10 +47,17 @@ public typealias BeforeSendBlock = (PostHogEvent) -> PostHogEvent?
     @objc public var preloadFeatureFlags: Bool = true
 
     /// Preload PostHog remote config automatically
-    /// Default: true
     ///
-    /// Note: Surveys rely on remote config. Disabling this will also disable Surveys
-    @objc public var remoteConfig: Bool = true
+    /// @deprecated Remote config is now always loaded. This option is a no-op and will be removed in a future version.
+    @available(*, deprecated, message: "Remote config is now always loaded. This option is a no-op and will be removed in a future version.")
+    @objc public var remoteConfig: Bool {
+        get { true }
+        set {
+            if !newValue {
+                hedgeLog("remoteConfig is deprecated and is now always enabled. Setting it to false has no effect.")
+            }
+        }
+    }
 
     @objc public var captureApplicationLifecycleEvents: Bool = true
     @objc public var captureScreenViews: Bool = true
@@ -153,11 +160,20 @@ public typealias BeforeSendBlock = (PostHogEvent) -> PostHogEvent?
 
     #if os(iOS)
         /// Enable Recording of Session Replays for iOS
+        ///
+        /// Note: Ingestion controls (sampling, feature flags, and event triggers) are currently applied using AND logic.
+        /// All configured conditions must be satisfied for recording to start.
+        ///
         /// Default: false
         @objc public var sessionReplay: Bool = false
         /// Session Replay configuration
         @objc public let sessionReplayConfig: PostHogSessionReplayConfig = .init()
     #endif
+
+    /// Configuration for error tracking.
+    ///
+    /// See known limitations: https://posthog.com/docs/error-tracking/installation/ios#limitations
+    @objc public let errorTrackingConfig: PostHogErrorTrackingConfig = .init()
 
     /// Enable mobile surveys
     ///
@@ -185,9 +201,16 @@ public typealias BeforeSendBlock = (PostHogEvent) -> PostHogEvent?
         set { setSurveysConfig(newValue) }
     }
 
+    /// Optional custom URLSessionConfiguration for network requests
+    /// If not set, uses URLSessionConfiguration.default
+    /// Useful for testing, proxying, or custom network configurations
+    @objc public var urlSessionConfiguration: URLSessionConfiguration?
+
     // only internal
     var disableReachabilityForTesting: Bool = false
     var disableQueueTimerForTesting: Bool = false
+    var disableFlushOnBackgroundForTesting: Bool = false
+    var disableRemoteConfigForTesting: Bool = false
     // internal
     public var storageManager: PostHogStorageManager?
 
@@ -211,6 +234,12 @@ public typealias BeforeSendBlock = (PostHogEvent) -> PostHogEvent?
     /// Returns an array of integrations to be installed based on current configuration
     func getIntegrations() -> [PostHogIntegration] {
         var integrations: [PostHogIntegration] = []
+
+        #if os(iOS) || os(macOS) || os(tvOS)
+            if errorTrackingConfig.autoCapture {
+                integrations.append(PostHogErrorTrackingAutoCaptureIntegration())
+            }
+        #endif
 
         if captureScreenViews {
             integrations.append(PostHogScreenViewIntegration())
