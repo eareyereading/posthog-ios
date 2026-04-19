@@ -39,7 +39,7 @@ let maxRetryDelay = 30.0
     private var cachedPersonPropertiesHash: String?
 
     private var queue: PostHogQueue?
-    private var replayQueue: PostHogQueue?
+    private(set) var replayQueue: PostHogReplayQueue?
     private(set) var storage: PostHogStorage?
     #if !os(watchOS)
         private var reachability: Reachability?
@@ -108,6 +108,11 @@ let maxRetryDelay = 30.0
             let api = PostHogApi(config)
 
             config.storageManager = config.storageManager ?? PostHogStorageManager(config)
+
+            // Ensure device_id is initialized before remote config loads, so it's
+            // available for flag requests. Seeded from the anonymous ID on first init.
+            _ = config.storageManager?.getDeviceId()
+
             remoteConfig = PostHogRemoteConfig(config, theStorage, api, { [weak self] in
                 self?.getDefaultPersonProperties() ?? [:]
             }, { [weak self] flagKey, flagValue in
@@ -132,10 +137,10 @@ let maxRetryDelay = 30.0
 
             #if !os(watchOS)
                 queue = PostHogQueue(config, theStorage, api, .batch, reachability)
-                replayQueue = PostHogQueue(config, theStorage, api, .snapshot, reachability)
+                replayQueue = PostHogReplayQueue(config, theStorage, api, reachability)
             #else
                 queue = PostHogQueue(config, theStorage, api, .batch)
-                replayQueue = PostHogQueue(config, theStorage, api, .snapshot)
+                replayQueue = PostHogReplayQueue(config, theStorage, api)
             #endif
 
             queue?.start(disableReachabilityForTesting: config.disableReachabilityForTesting,
@@ -188,6 +193,17 @@ let maxRetryDelay = 30.0
         }
 
         return config.storageManager?.getAnonymousId() ?? ""
+    }
+
+    /// Returns the stable device identifier used for device-level feature flag bucketing.
+    /// This ID persists across `identify()` and `reset()` calls, only changing on a fresh
+    /// app install, manual cache clearing, or OS-initiated storage cleanup.
+    @objc public func getDeviceId() -> String {
+        if !isEnabled() {
+            return ""
+        }
+
+        return config.storageManager?.getDeviceId() ?? ""
     }
 
     @objc public func getSessionId() -> String? {
@@ -954,8 +970,11 @@ let maxRetryDelay = 30.0
         }
 
         // Session Replay has its own queue
-        if let targetQueue = isSnapshotEvent ? replayQueue : queue {
-            queueEvent(posthogEvent, queue: targetQueue)
+        if isSnapshotEvent {
+            replayQueue?.add(posthogEvent)
+            onEventCaptured.invoke(posthogEvent)
+        } else {
+            queueEvent(posthogEvent, queue: queue)
         }
     }
 

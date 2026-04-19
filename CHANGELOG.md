@@ -1,5 +1,37 @@
 ## Next
 
+## 3.54.0
+
+### Minor Changes
+
+- feeaeac: support survey popup delay
+
+## 3.53.1
+
+### Patch Changes
+
+- 3588c05: fix: swift 5.3 compatibility issue with Xcode 15.4
+
+## 3.53.0
+
+### Minor Changes
+
+- 51022cd: feat: support session replay minimum recording duration
+
+## 3.52.0
+
+### Minor Changes
+
+- c01ece0: Add device bucketing support for stable feature flag assignment across identity changes
+
+### Patch Changes
+
+- c01ece0: Use renamed version/release on dsym upload
+
+## 3.51.0
+
+⚠️ Skip this version, this is a broken release and should not be used.
+
 ## 3.50.0
 
 ### Minor Changes
@@ -83,6 +115,8 @@
 ### Minor Changes
 
 - 33fe226: feat: add experimental error tracking support
+
+⚠️ **Known issue (Swift 5.3 + older Xcode):** This release introduced a Swift 5.3 compatibility regression when building with older Xcode versions (Swift 5.3 toolchain). If you compile with Swift 5.3 and experience errors, use a version before 3.45.0 or upgrade to 3.53.1+.
 
 ## 3.44.0
 
