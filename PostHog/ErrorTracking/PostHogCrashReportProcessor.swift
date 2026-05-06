@@ -8,16 +8,17 @@
 import Foundation
 
 #if os(iOS) || os(macOS) || os(tvOS)
-    import CrashReporter
+    // Vendored crash reporting is an implementation detail.
+    @_implementationOnly import PHPLCrashReporter
 
     enum PostHogCrashReportProcessor {
-        /// Process a PLCrashReport and convert it to PostHog $exception event properties
+        /// Process a PHPLCrashReport and convert it to PostHog $exception event properties
         ///
         /// - Parameters:
-        ///   - report: The PLCrashReport to process
+        ///   - report: The PHPLCrashReport to process
         ///   - config: Error tracking configuration for in-app detection
         /// - Returns: Dictionary of exception-specific properties for the $exception event
-        static func processReport(_ report: PLCrashReport, config: PostHogErrorTrackingConfig) -> [String: Any] {
+        static func processReport(_ report: PHPLCrashReport, config: PostHogErrorTrackingConfig) -> [String: Any] {
             var properties: [String: Any] = [:]
 
             // Fatal crash
@@ -47,13 +48,13 @@ import Foundation
         }
 
         /// Get the crash timestamp from the report
-        static func getCrashTimestamp(_ report: PLCrashReport) -> Date? {
+        static func getCrashTimestamp(_ report: PHPLCrashReport) -> Date? {
             report.systemInfo?.timestamp
         }
 
         // MARK: - Exception Building
 
-        private static func buildExceptionInfo(from report: PLCrashReport, stackFrames: [PostHogStackFrame]) -> [String: Any]? {
+        private static func buildExceptionInfo(from report: PHPLCrashReport, stackFrames: [PostHogStackFrame]) -> [String: Any]? {
             var exception: [String: Any] = [:]
 
             // Determine exception type and value based on crash type
@@ -62,7 +63,7 @@ import Foundation
                 // NSException - has actual exception name and reason
                 //
                 // Limitation: Unfortunately we cannot walk the exception chain via NSUnderlyingErrorKey because
-                // PLCrashReportExceptionInfo only exposes name, reason, and stackFrames. The original userInfo dictionary is not serialized.
+                // PHPLCrashReportExceptionInfo only exposes name, reason, and stackFrames. The original userInfo dictionary is not serialized.
                 // The chain information is lost at crash time.
                 exception["type"] = nsExceptionInfo.exceptionName
                 exception["value"] = nsExceptionInfo.exceptionReason
@@ -75,18 +76,21 @@ import Foundation
             } else if let signalInfo = report.signalInfo {
                 // POSIX signal - more familiar to developers (SIGTRAP, SIGABRT, etc.)
                 //
-                // Limitation: Swift crashes (fatalError, preconditionFailure, force unwrap, etc.) appear as SIGTRAP.
-                // The actual error message is stored in the __crash_info Mach-O section of libswiftCore.dylib,
-                // which PLCrashReporter doesn't expose. Sentry/Bugsnag parse this section to get the message.
-                // See: https://github.com/getsentry/sentry-cocoa/pull/1596
-                //      https://github.com/bugsnag/bugsnag-cocoa/pull/948
-                // Future enhancement: implement __crash_info parsing in PLCrashReporter for richer Swift crash messages.
-                exception["type"] = signalInfo.name
-                exception["value"] = signalMessage(signalInfo)
+                // For Swift runtime traps (fatalError/assert/precondition), use __crash_info
+                // to override the generic signal type while preserving the original message.
+                let crashInfoMessage = crashInfoMessage(from: report)
+                if let crashInfoMessage, let fatalErrorType = swiftFatalErrorType(from: crashInfoMessage) {
+                    exception["type"] = fatalErrorType
+                    exception["value"] = crashInfoMessage
+                } else {
+                    exception["type"] = signalInfo.name
+                    exception["value"] = signalMessage(signalInfo)
+                }
 
                 let signalMeta: [String: Any?] = [
                     "code": signalInfo.code,
                     "name": signalInfo.name,
+                    "crash_info_message": crashInfoMessage,
                 ].compactMapValues { $0 }
 
                 exception["mechanism"] = [
@@ -118,7 +122,7 @@ import Foundation
 
             // Add stack trace from frames.
             // Frames are stored bottom-up (outermost/main first, crash site last) to match
-            // the Sentry event format. PLCrashReport delivers them top-down, so reverse.
+            // the Sentry event format. PHPLCrashReport delivers them top-down, so reverse.
             if !stackFrames.isEmpty {
                 exception["stacktrace"] = [
                     "frames": stackFrames.reversed().map { frame in frame.toDictionary },
@@ -127,7 +131,7 @@ import Foundation
             }
 
             // Add thread ID of crashed thread
-            // Note: Uses PLCrashReporter's threadNumber (sequential index) rather than Mach thread ID,
+            // Note: Uses PHPLCrashReporter's threadNumber (sequential index) rather than Mach thread ID,
             // since the original process has terminated and pthread_mach_thread_np is not available.
             if let crashedThread = findCrashedThread(in: report) {
                 exception["thread_id"] = crashedThread.threadNumber
@@ -146,18 +150,18 @@ import Foundation
         /// For signals/mach exceptions, uses the crashed thread's stack frames.
 
         private static func buildStackFrames(
-            from report: PLCrashReport,
+            from report: PHPLCrashReport,
             config: PostHogErrorTrackingConfig
         ) -> [PostHogStackFrame] {
             // For NSExceptions, prefer the exception's original stack frames
-            let rawFrames: [PLCrashReportStackFrameInfo]
+            let rawFrames: [PHPLCrashReportStackFrameInfo]
             if report.hasExceptionInfo,
-               let exceptionFrames = report.exceptionInfo?.stackFrames as? [PLCrashReportStackFrameInfo],
+               let exceptionFrames = report.exceptionInfo?.stackFrames as? [PHPLCrashReportStackFrameInfo],
                !exceptionFrames.isEmpty
             {
                 rawFrames = exceptionFrames
             } else if let crashedThread = findCrashedThread(in: report) {
-                rawFrames = crashedThread.stackFrames as? [PLCrashReportStackFrameInfo] ?? []
+                rawFrames = crashedThread.stackFrames as? [PHPLCrashReportStackFrameInfo] ?? []
             } else {
                 return []
             }
@@ -206,19 +210,19 @@ import Foundation
             return frames
         }
 
-        private static func findCrashedThread(in report: PLCrashReport) -> PLCrashReportThreadInfo? {
-            for case let thread as PLCrashReportThreadInfo in report.threads where thread.crashed {
+        private static func findCrashedThread(in report: PHPLCrashReport) -> PHPLCrashReportThreadInfo? {
+            for case let thread as PHPLCrashReportThreadInfo in report.threads where thread.crashed {
                 return thread
             }
             // Fallback to first thread if none marked as crashed
-            return report.threads.first as? PLCrashReportThreadInfo
+            return report.threads.first as? PHPLCrashReportThreadInfo
         }
 
         // MARK: - Debug Images
 
         /// Build debug images for symbolication, including only images referenced in the stack frames.
         private static func buildDebugImages(
-            from report: PLCrashReport,
+            from report: PHPLCrashReport,
             stackFrames: [PostHogStackFrame]
         ) -> [[String: Any]] {
             // Extract unique image addresses from stack frames
@@ -227,7 +231,7 @@ import Foundation
 
             var debugImages: [PostHogBinaryImageInfo] = []
 
-            for case let image as PLCrashReportBinaryImageInfo in report.images {
+            for case let image as PHPLCrashReportBinaryImageInfo in report.images {
                 guard referencedImageAddresses.contains(image.imageBaseAddress),
                       let imageName = image.imageName
                 else { continue }
@@ -242,7 +246,7 @@ import Foundation
                 let binaryImage = PostHogBinaryImageInfo(
                     name: imageName,
                     uuid: image.imageUUID?.formattedAsUUID,
-                    vmAddress: nil, // PLCrashReport doesn't expose vmAddress
+                    vmAddress: nil, // PHPLCrashReport doesn't expose vmAddress
                     address: image.imageBaseAddress,
                     size: image.imageSize,
                     arch: arch
@@ -369,7 +373,7 @@ import Foundation
             6: breakpointCodeNames, // EXC_BREAKPOINT
         ]
 
-        private static func machExceptionMessage(_ exception: PLCrashReportMachExceptionInfo) -> String {
+        private static func machExceptionMessage(_ exception: PHPLCrashReportMachExceptionInfo) -> String {
             let typeName = machExceptionName(exception.type)
 
             guard let codesArray = exception.codes as? [NSNumber], !codesArray.isEmpty else {
@@ -398,7 +402,55 @@ import Foundation
             }
         }
 
-        private static func signalMessage(_ signal: PLCrashReportSignalInfo) -> String? {
+        static func sanitizeCrashInfoMessage(_ message: String?) -> String? {
+            guard let sanitizedMessage = message?.trimmingCharacters(in: .whitespacesAndNewlines), !sanitizedMessage.isEmpty else {
+                return nil
+            }
+            return sanitizedMessage
+        }
+
+        private static func crashInfoMessage(from report: PHPLCrashReport) -> String? {
+            guard let signalInfo = report.signalInfo else {
+                return nil
+            }
+            return sanitizeCrashInfoMessage(signalInfo.crashInfoMessage)
+        }
+
+        static func swiftFatalErrorType(from message: String?) -> String? {
+            guard let message else {
+                return nil
+            }
+            return parseSwiftFatalErrorType(message)
+        }
+
+        private static let swiftFatalErrorRegex = try? NSRegularExpression(
+            pattern: "^(Assertion failed|Fatal error|Precondition failed): ((.+): )?file .+, line \\d+$",
+            options: .caseInsensitive
+        )
+
+        private static let swiftSourceLocationFatalErrorRegex = try? NSRegularExpression(
+            pattern: "^.+\\.swift:\\d+: (Assertion failed|Fatal error|Precondition failed): .+$",
+            options: .caseInsensitive
+        )
+
+        private static func parseSwiftFatalErrorType(_ message: String) -> String? {
+            firstCaptureGroup(in: message, matching: swiftFatalErrorRegex)
+                ?? firstCaptureGroup(in: message, matching: swiftSourceLocationFatalErrorRegex)
+        }
+
+        private static func firstCaptureGroup(in message: String, matching regex: NSRegularExpression?) -> String? {
+            let range = NSRange(message.startIndex ..< message.endIndex, in: message)
+            guard let match = regex?.firstMatch(in: message, options: [], range: range),
+                  match.numberOfRanges >= 2,
+                  let errorTypeRange = Range(match.range(at: 1), in: message)
+            else {
+                return nil
+            }
+
+            return String(message[errorTypeRange])
+        }
+
+        private static func signalMessage(_ signal: PHPLCrashReportSignalInfo) -> String? {
             guard let name = signal.name, let code = signal.code else {
                 return nil
             }

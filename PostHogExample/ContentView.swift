@@ -49,7 +49,7 @@ class FeatureFlagsModel: ObservableObject {
     @objc func reloaded() {
         boolValue = PostHogSDK.shared.isFeatureEnabled("4535-funnel-bar-viz")
         stringValue = PostHogSDK.shared.getFeatureFlag("multivariant") as? String
-        payloadValue = PostHogSDK.shared.getFeatureFlagPayload("multivariant") as? [String: String]
+        payloadValue = PostHogSDK.shared.getFeatureFlagResult("multivariant")?.payload as? [String: String]
     }
 
     func reload() {
@@ -131,19 +131,19 @@ struct ContentView: View {
 
     private func asyncLevel1() async throws {
         // Simulate some async work
-        await Task.sleep(10_000_000) // 0.01 seconds
+        try await Task.sleep(nanoseconds: 10_000_000) // 0.01 seconds
         try await asyncLevel2()
     }
 
     private func asyncLevel2() async throws {
         // Simulate more async work
-        await Task.sleep(20_000_000) // 0.02 seconds
+        try await Task.sleep(nanoseconds: 20_000_000) // 0.02 seconds
         try await asyncLevel3()
     }
 
     private func asyncLevel3() async throws {
         // Simulate final async work before error
-        await Task.sleep(30_000_000) // 0.03 seconds
+        try await Task.sleep(nanoseconds: 30_000_000) // 0.03 seconds
 
         // Throw an error from deep in the async chain
         throw AsyncTestError.deepAsyncError(
@@ -291,9 +291,17 @@ struct ContentView: View {
                     Button("Uncaught NSException") {
                         PHGExceptionHandler.triggerUncaughtNSException()
                     }
-                    // SIGTRAP - message not captured (see PostHogCrashReportProcessor for details)
+                    // SIGTRAP - Swift runtime trap with message from __crash_info
                     Button("fatalError()") {
                         SwiftCrashTriggers.triggerFatalError()
+                    }
+                    // SIGTRAP - Swift runtime trap with message from __crash_info
+                    Button("preconditionFailure()") {
+                        SwiftCrashTriggers.triggerPreconditionFailure()
+                    }
+                    // SIGTRAP - debug-only Swift assertion trap with message from __crash_info
+                    Button("assertionFailure() (Debug)") {
+                        SwiftCrashTriggers.triggerAssertionFailure()
                     }
                     // SIGTRAP - Swift runtime trap on nil unwrap
                     Button("Force unwrap nil") {

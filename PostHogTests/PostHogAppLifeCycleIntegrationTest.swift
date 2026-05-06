@@ -35,11 +35,17 @@ final class PostHogAppLifeCycleIntegrationTest {
         captureApplicationLifecycleEvents: Bool = true,
         disableFlushOnBackgroundForTesting: Bool = true
     ) -> PostHogSDK {
-        let config = PostHogConfig(apiKey: "app_lifecycle", host: "http://localhost:9000")
+        let config = PostHogConfig(projectToken: "test_project_token", host: "http://localhost:9000")
         config.captureApplicationLifecycleEvents = captureApplicationLifecycleEvents
         config.flushAt = flushAt
         config.maxBatchSize = flushAt
         config.disableFlushOnBackgroundForTesting = disableFlushOnBackgroundForTesting
+        // Reachability now genuinely fires events queue callbacks (the events
+        // queue used to be silently disconnected by the replay queue's
+        // subscription). On a `.wifi` connection the queue auto-flushes shortly
+        // after start, which is fine in production but causes lifecycle tests
+        // to see an early single-event batch instead of the expected count.
+        config.disableReachabilityForTesting = true
 
         let storage = PostHogStorage(config)
         storage.reset()
@@ -113,7 +119,7 @@ final class PostHogAppLifeCycleIntegrationTest {
 
             print("running tests")
             #expect(events.first?.properties["$app_version"] != nil)
-            #expect(events.first?.properties["build"] != nil)
+            #expect(events.first?.properties["$app_build"] != nil)
             #expect(events.first?.properties["build"] != nil)
 
             #expect(UserDefaults.standard.string(forKey: "PHGVersionKey") != nil)
@@ -147,8 +153,9 @@ final class PostHogAppLifeCycleIntegrationTest {
 
             print("running tests")
             #expect(events.first?.properties["$app_version"] != nil)
+            #expect(events.first?.properties["$app_build"] != nil)
             #expect(events.first?.properties["build"] != nil)
-            #expect(events.first?.properties["build"] != nil)
+            #expect(events.first?.properties["previous_build"] != nil)
 
             #expect(UserDefaults.standard.string(forKey: "PHGVersionKey") != nil)
             #expect(UserDefaults.standard.string(forKey: "PHGBuildKeyV2") != nil)
@@ -181,7 +188,7 @@ final class PostHogAppLifeCycleIntegrationTest {
 
             print("running tests")
             #expect(events.first?.properties["$app_version"] != nil)
-            #expect(events.first?.properties["build"] != nil)
+            #expect(events.first?.properties["$app_build"] != nil)
             #expect(events.first?.properties["build"] != nil)
 
             #expect(UserDefaults.standard.string(forKey: "PHGVersionKey") != nil)
@@ -256,6 +263,7 @@ final class PostHogAppLifeCycleIntegrationTest {
         #if targetEnvironment(simulator)
             #expect(events[1].properties["version"] != nil)
             #expect(events[1].properties["build"] != nil)
+            #expect(events[1].properties["$app_build"] != nil)
         #endif
 
         sut.close()
@@ -334,6 +342,7 @@ final class PostHogAppLifeCycleIntegrationTest {
         #if targetEnvironment(simulator)
             #expect(events[1].properties["version"] != nil)
             #expect(events[1].properties["build"] != nil)
+            #expect(events[1].properties["$app_build"] != nil)
         #endif
 
         sut.close()

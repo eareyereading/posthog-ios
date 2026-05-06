@@ -10,7 +10,9 @@ import Foundation
 import Testing
 
 #if os(iOS) || os(macOS) || os(tvOS)
-    import CrashReporter
+    #if canImport(PHPLCrashReporter)
+        @_implementationOnly import PHPLCrashReporter
+    #endif
 
     @Suite("PostHogCrashReportProcessor Tests")
     struct PostHogCrashReportProcessorTest {
@@ -22,14 +24,14 @@ import Testing
 
             @Test("processes live crash report")
             func processesLiveCrashReport() throws {
-                let reporter = PLCrashReporter(configuration: PLCrashReporterConfig.defaultConfiguration())
+                let reporter = PHPLCrashReporter(configuration: PHPLCrashReporterConfig.defaultConfiguration())
                 guard let reporter else {
-                    Issue.record("Failed to create PLCrashReporter")
+                    Issue.record("Failed to create PHPLCrashReporter")
                     return
                 }
 
                 let reportData = try reporter.generateLiveReportAndReturnError()
-                let report = try PLCrashReport(data: reportData)
+                let report = try PHPLCrashReport(data: reportData)
 
                 let properties = PostHogCrashReportProcessor.processReport(report, config: config)
 
@@ -39,14 +41,14 @@ import Testing
 
             @Test("live report contains exception list")
             func liveReportContainsExceptionList() throws {
-                let reporter = PLCrashReporter(configuration: PLCrashReporterConfig.defaultConfiguration())
+                let reporter = PHPLCrashReporter(configuration: PHPLCrashReporterConfig.defaultConfiguration())
                 guard let reporter else {
-                    Issue.record("Failed to create PLCrashReporter")
+                    Issue.record("Failed to create PHPLCrashReporter")
                     return
                 }
 
                 let reportData = try reporter.generateLiveReportAndReturnError()
-                let report = try PLCrashReport(data: reportData)
+                let report = try PHPLCrashReport(data: reportData)
 
                 let properties = PostHogCrashReportProcessor.processReport(report, config: config)
 
@@ -57,14 +59,14 @@ import Testing
 
             @Test("live report exception has type and mechanism")
             func liveReportExceptionHasTypeAndMechanism() throws {
-                let reporter = PLCrashReporter(configuration: PLCrashReporterConfig.defaultConfiguration())
+                let reporter = PHPLCrashReporter(configuration: PHPLCrashReporterConfig.defaultConfiguration())
                 guard let reporter else {
-                    Issue.record("Failed to create PLCrashReporter")
+                    Issue.record("Failed to create PHPLCrashReporter")
                     return
                 }
 
                 let reportData = try reporter.generateLiveReportAndReturnError()
-                let report = try PLCrashReport(data: reportData)
+                let report = try PHPLCrashReport(data: reportData)
 
                 let properties = PostHogCrashReportProcessor.processReport(report, config: config)
 
@@ -83,14 +85,14 @@ import Testing
 
             @Test("live report contains stack trace")
             func liveReportContainsStackTrace() throws {
-                let reporter = PLCrashReporter(configuration: PLCrashReporterConfig.defaultConfiguration())
+                let reporter = PHPLCrashReporter(configuration: PHPLCrashReporterConfig.defaultConfiguration())
                 guard let reporter else {
-                    Issue.record("Failed to create PLCrashReporter")
+                    Issue.record("Failed to create PHPLCrashReporter")
                     return
                 }
 
                 let reportData = try reporter.generateLiveReportAndReturnError()
-                let report = try PLCrashReport(data: reportData)
+                let report = try PHPLCrashReport(data: reportData)
 
                 let properties = PostHogCrashReportProcessor.processReport(report, config: config)
 
@@ -109,14 +111,14 @@ import Testing
 
             @Test("live report frames have instruction addresses")
             func liveReportFramesHaveInstructionAddresses() throws {
-                let reporter = PLCrashReporter(configuration: PLCrashReporterConfig.defaultConfiguration())
+                let reporter = PHPLCrashReporter(configuration: PHPLCrashReporterConfig.defaultConfiguration())
                 guard let reporter else {
-                    Issue.record("Failed to create PLCrashReporter")
+                    Issue.record("Failed to create PHPLCrashReporter")
                     return
                 }
 
                 let reportData = try reporter.generateLiveReportAndReturnError()
-                let report = try PLCrashReport(data: reportData)
+                let report = try PHPLCrashReport(data: reportData)
 
                 let properties = PostHogCrashReportProcessor.processReport(report, config: config)
 
@@ -134,14 +136,14 @@ import Testing
 
             @Test("live report contains debug images")
             func liveReportContainsDebugImages() throws {
-                let reporter = PLCrashReporter(configuration: PLCrashReporterConfig.defaultConfiguration())
+                let reporter = PHPLCrashReporter(configuration: PHPLCrashReporterConfig.defaultConfiguration())
                 guard let reporter else {
-                    Issue.record("Failed to create PLCrashReporter")
+                    Issue.record("Failed to create PHPLCrashReporter")
                     return
                 }
 
                 let reportData = try reporter.generateLiveReportAndReturnError()
-                let report = try PLCrashReport(data: reportData)
+                let report = try PHPLCrashReport(data: reportData)
 
                 let properties = PostHogCrashReportProcessor.processReport(report, config: config)
 
@@ -152,14 +154,14 @@ import Testing
 
             @Test("debug images have required fields")
             func debugImagesHaveRequiredFields() throws {
-                let reporter = PLCrashReporter(configuration: PLCrashReporterConfig.defaultConfiguration())
+                let reporter = PHPLCrashReporter(configuration: PHPLCrashReporterConfig.defaultConfiguration())
                 guard let reporter else {
-                    Issue.record("Failed to create PLCrashReporter")
+                    Issue.record("Failed to create PHPLCrashReporter")
                     return
                 }
 
                 let reportData = try reporter.generateLiveReportAndReturnError()
-                let report = try PLCrashReport(data: reportData)
+                let report = try PHPLCrashReport(data: reportData)
 
                 let properties = PostHogCrashReportProcessor.processReport(report, config: config)
 
@@ -183,14 +185,14 @@ import Testing
         struct CrashTimestampTests {
             @Test("extracts crash timestamp from report")
             func extractsCrashTimestamp() throws {
-                let reporter = PLCrashReporter(configuration: PLCrashReporterConfig.defaultConfiguration())
+                let reporter = PHPLCrashReporter(configuration: PHPLCrashReporterConfig.defaultConfiguration())
                 guard let reporter else {
-                    Issue.record("Failed to create PLCrashReporter")
+                    Issue.record("Failed to create PHPLCrashReporter")
                     return
                 }
 
                 let reportData = try reporter.generateLiveReportAndReturnError()
-                let report = try PLCrashReport(data: reportData)
+                let report = try PHPLCrashReport(data: reportData)
 
                 let timestamp = PostHogCrashReportProcessor.getCrashTimestamp(report)
 
@@ -209,14 +211,14 @@ import Testing
                 let config = PostHogErrorTrackingConfig()
                 config.inAppIncludes = ["xctest"]
 
-                let reporter = PLCrashReporter(configuration: PLCrashReporterConfig.defaultConfiguration())
+                let reporter = PHPLCrashReporter(configuration: PHPLCrashReporterConfig.defaultConfiguration())
                 guard let reporter else {
-                    Issue.record("Failed to create PLCrashReporter")
+                    Issue.record("Failed to create PHPLCrashReporter")
                     return
                 }
 
                 let reportData = try reporter.generateLiveReportAndReturnError()
-                let report = try PLCrashReport(data: reportData)
+                let report = try PHPLCrashReport(data: reportData)
 
                 let properties = PostHogCrashReportProcessor.processReport(report, config: config)
 
@@ -233,14 +235,14 @@ import Testing
             func marksSystemFramesAsNotInApp() throws {
                 let config = PostHogErrorTrackingConfig()
 
-                let reporter = PLCrashReporter(configuration: PLCrashReporterConfig.defaultConfiguration())
+                let reporter = PHPLCrashReporter(configuration: PHPLCrashReporterConfig.defaultConfiguration())
                 guard let reporter else {
-                    Issue.record("Failed to create PLCrashReporter")
+                    Issue.record("Failed to create PHPLCrashReporter")
                     return
                 }
 
                 let reportData = try reporter.generateLiveReportAndReturnError()
-                let report = try PLCrashReport(data: reportData)
+                let report = try PHPLCrashReport(data: reportData)
 
                 let properties = PostHogCrashReportProcessor.processReport(report, config: config)
 
@@ -269,14 +271,14 @@ import Testing
             func exceptionHasThreadId() throws {
                 let config = PostHogErrorTrackingConfig()
 
-                let reporter = PLCrashReporter(configuration: PLCrashReporterConfig.defaultConfiguration())
+                let reporter = PHPLCrashReporter(configuration: PHPLCrashReporterConfig.defaultConfiguration())
                 guard let reporter else {
-                    Issue.record("Failed to create PLCrashReporter")
+                    Issue.record("Failed to create PHPLCrashReporter")
                     return
                 }
 
                 let reportData = try reporter.generateLiveReportAndReturnError()
-                let report = try PLCrashReport(data: reportData)
+                let report = try PHPLCrashReport(data: reportData)
 
                 let properties = PostHogCrashReportProcessor.processReport(report, config: config)
 
@@ -284,6 +286,43 @@ import Testing
                 let exception = exceptionList?.first
 
                 #expect(exception?["thread_id"] != nil)
+            }
+        }
+
+        // MARK: - Crash Info Type Tests
+
+        @Suite("Crash Info Type")
+        struct CrashInfoTypeTests {
+            @Test("parses Swift fatal error type")
+            func parsesSwiftFatalErrorType() {
+                #expect(PostHogCrashReportProcessor.swiftFatalErrorType(from: nil) == nil)
+                #expect(PostHogCrashReportProcessor.swiftFatalErrorType(from: "  \n") == nil)
+
+                #expect(PostHogCrashReportProcessor.swiftFatalErrorType(
+                    from: "Fatal error: Unexpectedly found nil while unwrapping an Optional value: file ExampleApp/ViewController.swift, line 53\n"
+                ) == "Fatal error")
+
+                #expect(PostHogCrashReportProcessor.swiftFatalErrorType(
+                    from: "Assertion failed: This should NEVER happen: file ExampleApp/AnotherClass.swift, line 24\n"
+                ) == "Assertion failed")
+
+                #expect(PostHogCrashReportProcessor.swiftFatalErrorType(
+                    from: "PostHogExample/SwiftCrashTriggers.swift:78: Fatal error: Intentional assertionFailure for crash testing"
+                ) == "Fatal error")
+
+                #expect(PostHogCrashReportProcessor.swiftFatalErrorType(
+                    from: "BUG IN CLIENT: dispatch_sync called on queue already owned by current thread"
+                ) == nil)
+
+                #expect(PostHogCrashReportProcessor.swiftFatalErrorType(
+                    from: "ExampleApp/ViewController.m:53: Fatal error: Objective-C source should not parse as Swift fatal"
+                ) == nil)
+            }
+
+            @Test("sanitizes crash info message")
+            func sanitizesCrashInfoMessage() {
+                let message = "\nFatal error: file ExampleApp/AnotherClass.swift, line 24\n"
+                #expect(PostHogCrashReportProcessor.sanitizeCrashInfoMessage(message) == "Fatal error: file ExampleApp/AnotherClass.swift, line 24")
             }
         }
     }
