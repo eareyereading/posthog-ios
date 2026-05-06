@@ -28,6 +28,7 @@ public typealias BeforeSendBlock = (PostHogEvent) -> PostHogEvent?
         #endif
         static let maxBatchSize: Int = 50
         static let flushIntervalSeconds: TimeInterval = 30
+        static let maxRetries: Int = 3
     }
 
     @objc(PostHogDataMode) public enum PostHogDataMode: Int {
@@ -37,11 +38,31 @@ public typealias BeforeSendBlock = (PostHogEvent) -> PostHogEvent?
     }
 
     @objc public let host: URL
-    @objc public let apiKey: String
+
+    /// Your PostHog project token.
+    ///
+    /// You can find it at:
+    /// https://us.posthog.com/settings/project-details#variables
+    ///
+    /// This field was formerly named <c>apiKey</c>.
+    @objc public let projectToken: String
+
+    /// Obsolete alias for <c>projectToken</c>.
+    @available(*, deprecated, message: "Use projectToken instead. This will be removed in the next major version.")
+    @objc public var apiKey: String {
+        hedgeLog("apiKey is deprecated and will be removed in the next major version. Use projectToken instead.")
+        return projectToken
+    }
     @objc public var flushAt: Int = Defaults.flushAt
     @objc public var maxQueueSize: Int = Defaults.maxQueueSize
     @objc public var maxBatchSize: Int = Defaults.maxBatchSize
     @objc public var flushIntervalSeconds: TimeInterval = Defaults.flushIntervalSeconds
+
+    /// Maximum number of consecutive flush attempts before the entire queue is
+    /// dropped to avoid infinite retries against a permanently-broken backend.
+    /// Increments on every retriable failure including HTTP 413 cap halving;
+    /// resets on a successful 2xx response. Default 3.
+    @objc public var maxRetries: Int = Defaults.maxRetries
     @objc public var dataMode: PostHogDataMode = .any
     @objc public var sendFeatureFlagEvent: Bool = true
     @objc public var preloadFeatureFlags: Bool = true
@@ -76,6 +97,9 @@ public typealias BeforeSendBlock = (PostHogEvent) -> PostHogEvent?
         /// Enable autocapture for iOS
         /// Default: false
         @objc public var captureElementInteractions: Bool = false
+
+        /// Rage click detection configuration
+        @objc public let rageClickConfig: PostHogRageClickConfig = .init()
     #endif
     @objc public var debug: Bool = false
     @objc public var optOut: Bool = false
@@ -93,10 +117,18 @@ public typealias BeforeSendBlock = (PostHogEvent) -> PostHogEvent?
     /// Defaults to false.
     @objc public var reuseAnonymousId: Bool = false
 
+    private var _propertiesSanitizer: PostHogPropertiesSanitizer?
+    var legacyPropertiesSanitizer: PostHogPropertiesSanitizer? {
+        _propertiesSanitizer
+    }
+
     /// Hook that allows to sanitize the event properties
     /// The hook is called before the event is cached or sent over the wire
     @available(*, deprecated, message: "Use beforeSend instead")
-    @objc public var propertiesSanitizer: PostHogPropertiesSanitizer?
+    @objc public var propertiesSanitizer: PostHogPropertiesSanitizer? {
+        get { _propertiesSanitizer }
+        set { _propertiesSanitizer = newValue }
+    }
     /// Determines the behavior for processing user profiles.
     @objc public var personProfiles: PostHogPersonProfiles = .identifiedOnly
 
@@ -159,6 +191,20 @@ public typealias BeforeSendBlock = (PostHogEvent) -> PostHogEvent?
     public static let defaultHost: String = "https://us.i.posthog.com"
 
     #if os(iOS)
+        /// When set, PostHog injects tracing headers into `URLSession` requests whose
+        /// destination hostname exactly matches one of the configured hostnames.
+        ///
+        /// Injected headers on iOS:
+        /// - `X-POSTHOG-DISTINCT-ID`
+        /// - `X-POSTHOG-SESSION-ID`
+        ///
+        /// Notes:
+        /// - Requires `enableSwizzling = true`
+        /// - Hostname matching is exact and does not include ports or subdomain wildcards
+        /// - iOS does not send `X-POSTHOG-WINDOW-ID` because mobile apps do not have a per-window/tab concept
+        /// - Existing values for these headers will be overwritten
+        @objc public var tracingHeaders: [String]?
+
         /// Enable Recording of Session Replays for iOS
         ///
         /// Note: Ingestion controls (sampling, feature flags, and event triggers) are currently applied using AND logic.
@@ -214,21 +260,50 @@ public typealias BeforeSendBlock = (PostHogEvent) -> PostHogEvent?
     // internal
     public var storageManager: PostHogStorageManager?
 
-    @objc(apiKey:)
+    private static func normalizeProjectToken(_ projectToken: String) -> String {
+        let normalizedProjectToken = projectToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        if normalizedProjectToken.isEmpty {
+            hedgeLog("Either projectToken or apiKey must be provided.")
+        }
+        return normalizedProjectToken
+    }
+
+    @objc(projectToken:)
     public init(
-        apiKey: String
+        projectToken: String
     ) {
-        self.apiKey = apiKey
+        self.projectToken = Self.normalizeProjectToken(projectToken)
         host = URL(string: PostHogConfig.defaultHost)!
     }
 
-    @objc(apiKey:host:)
+    @objc(projectToken:host:)
     public init(
+        projectToken: String,
+        host: String = defaultHost
+    ) {
+        let normalizedHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        self.projectToken = Self.normalizeProjectToken(projectToken)
+        self.host = URL(string: normalizedHost.isEmpty ? PostHogConfig.defaultHost : normalizedHost) ?? URL(string: PostHogConfig.defaultHost)!
+    }
+
+    @available(*, deprecated, message: "Use init(projectToken:) instead. This will be removed in the next major version.")
+    @objc(apiKey:)
+    public convenience init(
+        apiKey: String
+    ) {
+        hedgeLog("apiKey is deprecated and will be removed in the next major version. Use projectToken instead.")
+        self.init(projectToken: apiKey)
+    }
+
+    @available(*, deprecated, message: "Use init(projectToken:host:) instead. This will be removed in the next major version.")
+    @objc(apiKey:host:)
+    public convenience init(
         apiKey: String,
         host: String = defaultHost
     ) {
-        self.apiKey = apiKey
-        self.host = URL(string: host) ?? URL(string: PostHogConfig.defaultHost)!
+        hedgeLog("apiKey is deprecated and will be removed in the next major version. Use projectToken instead.")
+        self.init(projectToken: apiKey, host: host)
     }
 
     /// Returns an array of integrations to be installed based on current configuration
@@ -250,6 +325,10 @@ public typealias BeforeSendBlock = (PostHogEvent) -> PostHogEvent?
         }
 
         #if os(iOS)
+            if tracingHeaders?.isEmpty == false {
+                integrations.append(PostHogTracingHeadersIntegration())
+            }
+
             if sessionReplay {
                 integrations.append(PostHogReplayIntegration())
             }
@@ -263,6 +342,10 @@ public typealias BeforeSendBlock = (PostHogEvent) -> PostHogEvent?
         #if os(iOS) || targetEnvironment(macCatalyst)
             if captureElementInteractions {
                 integrations.append(PostHogAutocaptureIntegration())
+            }
+
+            if rageClickConfig.enabled {
+                integrations.append(PostHogRageClickIntegration())
             }
         #endif
 

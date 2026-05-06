@@ -47,7 +47,7 @@ let maxRetryDelay = 30.0
     private var flagCallReported: [String: [Any?]] = .init()
     private(set) var remoteConfig: PostHogRemoteConfig?
     private var context: PostHogContext?
-    private static var apiKeys = Set<String>()
+    private static var projectTokens = Set<String>()
     private var installedIntegrations: [PostHogIntegration] = []
     let sessionManager = PostHogSessionManager()
     let onEventCaptured = PostHogMulticastCallback<PostHogEvent>()
@@ -61,13 +61,9 @@ let maxRetryDelay = 30.0
 
     // nonisolated(unsafe) is introduced in Swift 5.10
     #if swift(>=5.10)
-        @objc public nonisolated(unsafe) static let shared: PostHogSDK = {
-            PostHogSDK(PostHogConfig(apiKey: ""))
-        }()
+        @objc public nonisolated(unsafe) static let shared: PostHogSDK = .init(PostHogConfig(projectToken: ""))
     #else
-        @objc public static let shared: PostHogSDK = {
-            PostHogSDK(PostHogConfig(apiKey: ""))
-        }()
+        @objc public static let shared: PostHogSDK = .init(PostHogConfig(projectToken: ""))
     #endif
 
     deinit {
@@ -95,10 +91,10 @@ let maxRetryDelay = 30.0
                 return
             }
 
-            if PostHogSDK.apiKeys.contains(config.apiKey) {
-                hedgeLog("API Key: \(config.apiKey) already has a PostHog instance.")
+            if PostHogSDK.projectTokens.contains(config.projectToken) {
+                hedgeLog("Project token: \(config.projectToken) already has a PostHog instance.")
             } else {
-                PostHogSDK.apiKeys.insert(config.apiKey)
+                PostHogSDK.projectTokens.insert(config.projectToken)
             }
 
             enabled = true
@@ -1044,8 +1040,41 @@ let maxRetryDelay = 30.0
         queueEvent(event, queue: queue)
     }
 
+    func rageclick(
+        eventType: String,
+        elementsChain: String,
+        properties: [String: Any]
+    ) {
+        if !isEnabled() {
+            return
+        }
+
+        if isOptOutState() {
+            return
+        }
+
+        guard let queue else {
+            return
+        }
+
+        let props = [
+            "$event_type": eventType,
+            "$elements_chain": elementsChain,
+        ].merging(sanitizeDictionary(properties) ?? [:]) { prop, _ in prop }
+
+        let distinctId = getDistinctId()
+
+        let properties = buildProperties(distinctId: distinctId, properties: props)
+
+        guard let event = buildEvent(event: "$rageclick", distinctId: distinctId, properties: properties) else {
+            return
+        }
+
+        queueEvent(event, queue: queue)
+    }
+
     private func sanitizeProperties(_ properties: [String: Any]) -> [String: Any] {
-        if let sanitizer = config.propertiesSanitizer {
+        if let sanitizer = config.legacyPropertiesSanitizer {
             return sanitizer.sanitize(properties)
         }
         return properties
@@ -1738,7 +1767,7 @@ let maxRetryDelay = 30.0
 
         setupLock.withLock {
             enabled = false
-            PostHogSDK.apiKeys.remove(config.apiKey)
+            PostHogSDK.projectTokens.remove(config.projectToken)
 
             queue?.stop()
             replayQueue?.stop()
@@ -1747,7 +1776,7 @@ let maxRetryDelay = 30.0
             replayQueue = nil
             config.storageManager?.reset(keepAnonymousId: config.reuseAnonymousId)
             config.storageManager = nil
-            config = PostHogConfig(apiKey: "")
+            config = PostHogConfig(projectToken: "")
             remoteConfig = nil
             storage = nil
             #if !os(watchOS)
@@ -1826,11 +1855,10 @@ let maxRetryDelay = 30.0
                 return hedgeLog("Could not start recording. Session replay feature flag is disabled.")
             }
 
-            let sessionId = resumeCurrent
+            guard (resumeCurrent
                 ? sessionManager.getSessionId()
-                : sessionManager.getNextSessionId()
-
-            guard let sessionId else {
+                : sessionManager.getNextSessionId()) != nil
+            else {
                 return hedgeLog("Could not start recording. Missing session id.")
             }
 
@@ -1880,6 +1908,10 @@ let maxRetryDelay = 30.0
     #if os(iOS) || targetEnvironment(macCatalyst)
         @objc public func isAutocaptureActive() -> Bool {
             isEnabled() && config.captureElementInteractions
+        }
+
+        @objc public func isRageClickActive() -> Bool {
+            isEnabled() && config.rageClickConfig.enabled
         }
     #endif
 
@@ -2001,25 +2033,25 @@ let maxRetryDelay = 30.0
                 continue
             }
 
-            do {
-                try integration.install(self)
-                installed.append(integration)
-
-                #if os(iOS)
-                    // TODO: Decouple these two integrations from PostHogSDK intance
-                    if let replayIntegration = integration as? PostHogReplayIntegration {
-                        self.replayIntegration = replayIntegration
-                    }
-
-                    if let surveysIntegration = integration as? PostHogSurveyIntegration {
-                        self.surveysIntegration = surveysIntegration
-                    }
-                #endif
-
-                hedgeLog("Integration \(type(of: integration)) installed")
-            } catch {
-                hedgeLog("Integration \(type(of: integration)) failed to install: \(error)")
+            if case let .skipped(reason) = integration.install(self) {
+                hedgeLog("Integration \(type(of: integration)) skipped: \(reason)")
+                continue
             }
+
+            installed.append(integration)
+
+            #if os(iOS)
+                // TODO: Decouple these two integrations from PostHogSDK intance
+                if let replayIntegration = integration as? PostHogReplayIntegration {
+                    self.replayIntegration = replayIntegration
+                }
+
+                if let surveysIntegration = integration as? PostHogSurveyIntegration {
+                    self.surveysIntegration = surveysIntegration
+                }
+            #endif
+
+            hedgeLog("Integration \(type(of: integration)) installed")
         }
 
         installedIntegrations = installed
@@ -2030,15 +2062,16 @@ let maxRetryDelay = 30.0
             guard replayIntegration == nil else { return }
 
             let integration = PostHogReplayIntegration()
-            do {
-                try integration.install(self)
-                installedIntegrations.append(integration)
-                replayIntegration = integration
-
-                hedgeLog("Integration \(type(of: integration)) installed")
-            } catch {
-                hedgeLog("Integration \(type(of: integration)) failed to install: \(error)")
+            let installOutcome = integration.install(self)
+            if case let .skipped(reason) = installOutcome {
+                hedgeLog("Integration \(type(of: integration)) skipped: \(reason)")
+                return
             }
+
+            installedIntegrations.append(integration)
+            replayIntegration = integration
+
+            hedgeLog("Integration \(type(of: integration)) installed")
         }
     #endif
 
@@ -2094,6 +2127,12 @@ let maxRetryDelay = 30.0
             func getAutocaptureIntegration() -> PostHogAutocaptureIntegration? {
                 installedIntegrations.compactMap {
                     $0 as? PostHogAutocaptureIntegration
+                }.first
+            }
+
+            func getRageClickIntegration() -> PostHogRageClickIntegration? {
+                installedIntegrations.compactMap {
+                    $0 as? PostHogRageClickIntegration
                 }.first
             }
         #endif

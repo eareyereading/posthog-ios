@@ -527,7 +527,7 @@ enum PostHogSurveysTest {
             server = MockPostHogServer()
             server.start()
 
-            let config = PostHogConfig(apiKey: testAPIKey, host: "http://localhost:9090")
+            let config = PostHogConfig(projectToken: testProjectToken, host: "http://localhost:9090")
             config._surveys = true
             config.flushAt = 1
             config.disableReachabilityForTesting = true
@@ -541,7 +541,8 @@ enum PostHogSurveysTest {
 
             PostHogSurveyIntegration.clearInstalls()
             integration = PostHogSurveyIntegration()
-            try integration.install(postHog)
+            let installOutcome = integration.install(postHog)
+            try #require(installOutcome == .installed)
         }
 
         deinit {
@@ -575,7 +576,7 @@ enum PostHogSurveysTest {
             server = MockPostHogServer()
             server.start()
 
-            let config = PostHogConfig(apiKey: testAPIKey, host: "http://localhost:9090")
+            let config = PostHogConfig(projectToken: testProjectToken, host: "http://localhost:9090")
             config._surveys = true
             config.flushAt = 1
             config.disableReachabilityForTesting = true
@@ -589,7 +590,8 @@ enum PostHogSurveysTest {
 
             PostHogSurveyIntegration.clearInstalls()
             integration = PostHogSurveyIntegration()
-            try integration.install(postHog)
+            let installOutcome = integration.install(postHog)
+            try #require(installOutcome == .installed)
         }
 
         @Test("activates survey when event name and properties match")
@@ -756,7 +758,7 @@ enum PostHogSurveysTest {
         let postHog: PostHogSDK
 
         init() {
-            let config = PostHogConfig(apiKey: "test", host: "http://localhost:9090")
+            let config = PostHogConfig(projectToken: "test_project_token", host: "http://localhost:9090")
             config._surveys = true
             config.disableFlushOnBackgroundForTesting = true
             postHog = PostHogSDK.with(config)
@@ -1044,7 +1046,8 @@ enum PostHogSurveysTest {
             server.remoteConfigSurveys = "[\(surveys.joined(separator: ","))]"
             let sut = PostHogSurveyIntegration()
             PostHogSurveyIntegration.clearInstalls()
-            try! sut.install(postHog)
+            let installOutcome = sut.install(postHog)
+            #expect(installOutcome == .installed)
             return sut
         }
 
@@ -1155,7 +1158,7 @@ enum PostHogSurveysTest {
         let storage: PostHogStorage
 
         init() {
-            let config = PostHogConfig(apiKey: "test", host: "http://localhost:9090")
+            let config = PostHogConfig(projectToken: "test_project_token", host: "http://localhost:9090")
             config._surveys = true
             config.disableFlushOnBackgroundForTesting = true
             postHog = PostHogSDK.with(config)
@@ -1214,7 +1217,8 @@ enum PostHogSurveysTest {
             server.remoteConfigSurveys = "[\(surveys.joined(separator: ","))]"
             let sut = PostHogSurveyIntegration()
             PostHogSurveyIntegration.clearInstalls()
-            try! sut.install(postHog)
+            let installOutcome = sut.install(postHog)
+            #expect(installOutcome == .installed)
             return sut
         }
 

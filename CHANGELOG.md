@@ -1,5 +1,64 @@
 ## Next
 
+## 3.57.5
+
+### Patch Changes
+
+- 04f7aa0: Clean up CocoaPods validation warnings from deprecated sanitizer access, unused lock results, and duplicate C++ linker flags.
+
+## 3.57.4
+
+### Patch Changes
+
+- 8407036: Fix events queue not responding to network reachability changes. The replay queue's subscription was silently overwriting the events queue's `whenReachable` / `whenUnreachable` callbacks since v3.0, so `dataMode = .wifi` was ignored, auto-flush on WiFi reconnect did not fire, and the offline pause was reactive after a wasted request. `Reachability` now exposes `onReachable` / `onUnreachable` multicast hooks; the legacy single-callback fields are deprecated.
+
+## 3.57.3
+
+### Patch Changes
+
+- 8e2658e: fix: capture Swift runtime crash messages from \_\_crash_info (covers fatalErrors, asserts, preconditions, and force unwraps)
+- fb97bb4: fix: resolve PLCrashReporter dependency and symbol conflicts by vendoring/prefixing crash reporter sources
+
+## 3.57.2
+
+### Patch Changes
+
+- cc2b23b: Include survey responses on iOS dismissal events and mark whether the dismissed survey was partially completed.
+
+## 3.57.1
+
+### Patch Changes
+
+- 150e83f: fix: improve session replay screenshot performance
+
+## 3.57.0
+
+### Minor Changes
+
+- 4273b7f: Add tracing header injection for URLSession requests.
+
+### Patch Changes
+
+- 6cebb23: fix: parse `build` as Int when possible on `Application Opened` events, matching `Application Installed` / `Application Updated`. Extracts the shared `CFBundleVersion` parsing into a reusable helper so all four `build` / `$app_build` / `previous_build` call sites stay consistent.
+
+## 3.56.0
+
+### Minor Changes
+
+- 47aaf2f: Rename apiKey to projectToken with backward-compatible aliases
+
+## 3.55.1
+
+### Patch Changes
+
+- 2278539: Trim surrounding whitespace from apiKey and host config before using them.
+
+## 3.55.0
+
+### Minor Changes
+
+- 6098042: feat: add support for $rageclick detection for iOS/macCatalyst
+
 ## 3.54.0
 
 ### Minor Changes
