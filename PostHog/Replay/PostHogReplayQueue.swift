@@ -8,7 +8,7 @@ import Foundation
 /// `PostHogReplayBufferDelegate`. When `delegate.isBuffering` is true,
 /// snapshots are routed to the buffer and `flush()` calls are suppressed.
 class PostHogReplayQueue {
-    private let innerQueue: PostHogQueue
+    private let innerQueue: PostHogQueue<PostHogEvent>
     private let bufferQueue: PostHogReplayBufferQueue
     private let bufferIOQueue = DispatchQueue(label: "com.posthog.ReplayBufferIO",
                                               target: .global(qos: .utility))
@@ -36,7 +36,7 @@ class PostHogReplayQueue {
              _ api: PostHogApi,
              _ reachability: Reachability?)
         {
-            innerQueue = PostHogQueue(config, storage, api, .snapshot, reachability)
+            innerQueue = PostHogQueue(config, storage, .snapshot(api: api), reachability)
             bufferQueue = PostHogReplayBufferQueue(queue: storage.url(forKey: .replayBufferQueue))
         }
     #else
@@ -44,7 +44,7 @@ class PostHogReplayQueue {
              _ storage: PostHogStorage,
              _ api: PostHogApi)
         {
-            innerQueue = PostHogQueue(config, storage, api, .snapshot)
+            innerQueue = PostHogQueue(config, storage, .snapshot(api: api))
             bufferQueue = PostHogReplayBufferQueue(queue: storage.url(forKey: .replayBufferQueue))
         }
     #endif
@@ -90,14 +90,9 @@ class PostHogReplayQueue {
     /// If called from the main thread, migration is offloaded to a utility queue
     /// to avoid blocking rendering. On background threads migration executes inline.
     func migrateBufferToQueue() {
-        if Thread.isMainThread {
-            bufferIOQueue.async { [weak self] in
-                self?.migrateBufferToQueueNow()
-            }
-            return
+        performBufferOperation { [weak self] in
+            self?.migrateBufferToQueueNow()
         }
-
-        migrateBufferToQueueNow()
     }
 
     /// Discards all buffered replay events.
@@ -105,14 +100,18 @@ class PostHogReplayQueue {
     /// If called from the main thread, clear is offloaded to a utility queue to
     /// avoid blocking rendering. On background threads clear executes inline.
     func clearBuffer() {
+        performBufferOperation { [weak self] in
+            self?.clearBufferNow()
+        }
+    }
+
+    private func performBufferOperation(_ operation: @escaping () -> Void) {
         if Thread.isMainThread {
-            bufferIOQueue.async { [weak self] in
-                self?.clearBufferNow()
-            }
+            bufferIOQueue.async(execute: operation)
             return
         }
 
-        clearBufferNow()
+        operation()
     }
 
     private func migrateBufferToQueueNow() {

@@ -10,9 +10,12 @@
     import Accelerate
     import CoreGraphics
     import Foundation
-
-    // Vendored WebP is an implementation detail.
-    @_implementationOnly import phlibwebp
+    #if compiler(>=6.0)
+        internal import phlibwebp
+    #else
+        // swiftlint:disable:next duplicate_imports
+        @_implementationOnly import phlibwebp
+    #endif
     import UIKit
 
     extension UIImage {
@@ -94,24 +97,24 @@
                 picture.use_argb = 1 // Lossy encoding uses YUV for internal bitstream
                 picture.width = Int32(width)
                 picture.height = Int32(height)
-                picture.writer = WebPMemoryWrite
+                picture.writer = PHWebPMemoryWrite
                 picture.custom_ptr = UnsafeMutableRawPointer(writerPointer)
             }
 
-            WebPMemoryWriterInit(&writer)
+            PHWebPMemoryWriterInit(&writer)
 
             defer {
-                WebPMemoryWriterClear(&writer)
-                WebPPictureFree(&picture)
+                PHWebPMemoryWriterClear(&writer)
+                PHWebPPictureFree(&picture)
             }
 
             let result: Int32
             if hasAlpha {
                 // RGBA8888 - 4 channels
-                result = WebPPictureImportRGBA(&picture, rgba.bindMemory(to: UInt8.self, capacity: 4), Int32(bytesPerRow))
+                result = PHWebPPictureImportRGBA(&picture, rgba.bindMemory(to: UInt8.self, capacity: 4), Int32(bytesPerRow))
             } else {
                 // RGB888 - 3 channels
-                result = WebPPictureImportRGB(&picture, rgba.bindMemory(to: UInt8.self, capacity: 3), Int32(bytesPerRow))
+                result = PHWebPPictureImportRGB(&picture, rgba.bindMemory(to: UInt8.self, capacity: 3), Int32(bytesPerRow))
             }
 
             if result == 0 {
@@ -119,7 +122,7 @@
                 return nil
             }
 
-            if WebPEncode(&config, &picture) == 0 {
+            if PHWebPEncode(&config, &picture) == 0 {
                 hedgeLog("Could not encode WebP image")
                 return nil
             }

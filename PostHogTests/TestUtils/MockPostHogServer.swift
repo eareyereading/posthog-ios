@@ -14,16 +14,48 @@ import XCTest
 class MockPostHogServer {
     var batchRequests = [URLRequest]()
     var snapshotRequests = [URLRequest]()
+    var logsRequests = [URLRequest]()
     var batchExpectation: XCTestExpectation?
     var snapshotExpectation: XCTestExpectation?
+    var logsExpectation: XCTestExpectation?
     var flagsExpectation: XCTestExpectation?
     var batchExpectationCount: Int?
     var snapshotExpectationCount: Int?
+    var logsExpectationCount: Int?
     var flagsExpectationCount: Int?
     var flagsRequests = [URLRequest]()
+    /// Appended from OHHTTPStubs' network queue while tests read/reset it from their own thread. The
+    /// push suite drives heavy cross-thread resend churn (mint queue + watchdog + context-change
+    /// resend), so unlike the other bare request arrays this one races — a lock keeps the concurrent
+    /// append from corrupting the array (segfault). Access only via `pushSubscriptionRequests`.
+    private let pushSubscriptionRequestsLock = NSLock()
+    private var _pushSubscriptionRequests = [URLRequest]()
+    var pushSubscriptionRequests: [URLRequest] {
+        get { pushSubscriptionRequestsLock.withLock { _pushSubscriptionRequests } }
+        set { pushSubscriptionRequestsLock.withLock { _pushSubscriptionRequests = newValue } }
+    }
+    /// Forces `/push_subscriptions` to reply 500 (independent of the global `return500`).
+    var returnPushSubscription500 = false
+    /// When set, `/push_subscriptions` replies with this exact status code (takes precedence over the
+    /// 500 toggles). Used to exercise non-retryable responses like 400.
+    var pushSubscriptionStatusCode: Int?
+    /// When set, picks the `/push_subscriptions` status per request (1-based request number); takes
+    /// precedence over all fixed toggles. Used for scripted sequences (e.g. 401 then 200).
+    var pushSubscriptionStatusHandler: ((Int) -> Int)?
+    /// When set, `/push_subscriptions` responses carry this `Retry-After` header value.
+    var pushSubscriptionRetryAfter: String?
+    /// When set, replaces the entire `/push_subscriptions` response (e.g. `HTTPStubsResponse(error:)`
+    /// to simulate a transport-level failure) — takes precedence over all status-based fields above.
+    var pushSubscriptionResponseHandler: ((URLRequest) -> HTTPStubsResponse)?
     private var stubDescriptors = [HTTPStubsDescriptor]()
     var flagsResponseDelay: TimeInterval = 0
+    var configResponseDelay: TimeInterval = 0
     var flagsResponseHandler: ((URLRequest) -> HTTPStubsResponse)?
+    /// If set, the closure is invoked for each `/i/v1/logs` request (with the
+    /// 1-based request number) and returns the stub response. If `nil`, the
+    /// server replies with `200 OK`. Errors thrown inside this closure are
+    /// surfaced as test failures by OHHTTPStubs.
+    var logsResponseHandler: ((URLRequest, Int) -> HTTPStubsResponse)?
     var version: Int = 3
 
     func trackBatchRequest(_ request: URLRequest) {
@@ -39,6 +71,14 @@ class MockPostHogServer {
 
         if snapshotRequests.count >= (snapshotExpectationCount ?? 0) {
             snapshotExpectation?.fulfill()
+        }
+    }
+
+    func trackLogsRequest(_ request: URLRequest) {
+        logsRequests.append(request)
+
+        if logsRequests.count >= (logsExpectationCount ?? 0) {
+            logsExpectation?.fulfill()
         }
     }
 
@@ -68,6 +108,7 @@ class MockPostHogServer {
     var flagsSkipReplayVariantName = false
     var replayVariantValue: Any = true
     var quotaLimitFeatureFlags: Bool = false
+    var minimalFlagCalledEvents: Bool = false
     var remoteConfigSurveys: String?
     var hasFeatureFlags: Bool? = true
     var featureFlags: [String: Any]?
@@ -130,6 +171,7 @@ class MockPostHogServer {
                         "version": 23,
                         "payload": "true",
                         "description": "This is an enabled flag",
+                        "has_experiment": true,
                     ],
                 ],
                 "string-value": [
@@ -146,6 +188,7 @@ class MockPostHogServer {
                         "version": 1,
                         "payload": "\"string-value\"",
                         "description": "",
+                        "has_experiment": false,
                     ],
                 ],
                 "disabled-flag": [
@@ -278,6 +321,10 @@ class MockPostHogServer {
                 ]
             }
 
+            if self.minimalFlagCalledEvents {
+                obj["minimalFlagCalledEvents"] = true
+            }
+
             if self.returnReplay {
                 var sessionRecording: [String: Any] = [
                     "endpoint": "/newS/",
@@ -330,6 +377,45 @@ class MockPostHogServer {
             }
         })
 
+        stubDescriptors.append(stub(condition: pathEndsWith("/push_subscriptions")) { request in
+            let requestCount = self.pushSubscriptionRequestsLock.withLock { () -> Int in
+                self._pushSubscriptionRequests.append(request)
+                return self._pushSubscriptionRequests.count
+            }
+
+            if let responseHandler = self.pushSubscriptionResponseHandler {
+                return responseHandler(request)
+            }
+
+            let status: Int
+            if let handler = self.pushSubscriptionStatusHandler {
+                status = handler(requestCount)
+            } else if let code = self.pushSubscriptionStatusCode {
+                status = code
+            } else if self.return500 || self.returnPushSubscription500 {
+                status = 500
+            } else {
+                status = 200
+            }
+
+            var headers: [String: String]?
+            if let retryAfter = self.pushSubscriptionRetryAfter {
+                headers = ["Retry-After": retryAfter]
+            }
+
+            let jsonObject: Any = (200 ... 299 ~= status) ? ["distinct_id": "test", "platform": "ios"] : []
+            return HTTPStubsResponse(jsonObject: jsonObject, statusCode: Int32(status), headers: headers)
+        })
+
+        stubDescriptors.append(stub(condition: pathEndsWith("/i/v1/logs")) { request in
+            // Default: 200 OK. Tests can install `logsResponseHandler` to vary
+            // the response per request (e.g. 413 then 200 for backpressure tests).
+            if let handler = self.logsResponseHandler {
+                return handler(request, self.logsRequests.count + 1)
+            }
+            return HTTPStubsResponse(jsonObject: ["status": "ok"], statusCode: 200, headers: nil)
+        })
+
         stubDescriptors.append(stub(condition: pathEndsWith("/config")) { _ in
             if self.return500 {
                 return HTTPStubsResponse(jsonObject: [], statusCode: 500, headers: nil)
@@ -358,6 +444,15 @@ class MockPostHogServer {
             let sessionRecordingPayload: String = {
                 if self.returnReplay {
                     var sessionRecording: [String: Any] = ["endpoint": "/s/"]
+                    // /config is the source of recording config (incl. the linked flag); mirror what
+                    // /flags emits so linked-flag gating can be evaluated from the cached remote config.
+                    if self.returnReplayWithVariant {
+                        if self.returnReplayWithMultiVariant {
+                            sessionRecording["linkedFlag"] = self.replayVariantValue
+                        } else {
+                            sessionRecording["linkedFlag"] = self.replayVariantName
+                        }
+                    }
                     if let sampleRate = self.sessionRecordingSampleRate {
                         sessionRecording["sampleRate"] = sampleRate
                     }
@@ -403,7 +498,11 @@ class MockPostHogServer {
                 }
                 """.data(using: .utf8)!
 
-            return HTTPStubsResponse(data: configData, statusCode: 200, headers: nil)
+            let response = HTTPStubsResponse(data: configData, statusCode: 200, headers: nil)
+            if self.configResponseDelay > 0 {
+                response.responseTime = self.configResponseDelay
+            }
+            return response
         })
 
         HTTPStubs.onStubActivation { request, _, _ in
@@ -411,14 +510,16 @@ class MockPostHogServer {
                 self.trackBatchRequest(request)
             } else if request.url?.lastPathComponent == "s" {
                 self.trackSnapshotRequest(request)
+            } else if request.url?.lastPathComponent == "logs" {
+                self.trackLogsRequest(request)
             } else if request.url?.lastPathComponent == "flags" {
                 self.trackFlags(request)
             }
         }
     }
 
-    func start(batchCount: Int = 1, snapshotCount: Int = 0) {
-        reset(batchCount: batchCount, snapshotCount: snapshotCount)
+    func start(batchCount: Int = 1, snapshotCount: Int = 0, logsCount: Int = 0) {
+        reset(batchCount: batchCount, snapshotCount: snapshotCount, logsCount: logsCount)
 
         HTTPStubs.setEnabled(true)
     }
@@ -432,21 +533,31 @@ class MockPostHogServer {
         stubDescriptors.removeAll()
     }
 
-    func reset(batchCount: Int = 1, snapshotCount: Int = 0, flagsCount: Int? = nil) {
+    func reset(batchCount: Int = 1, snapshotCount: Int = 0, flagsCount: Int? = nil, logsCount: Int = 0) {
         batchRequests = []
         snapshotRequests = []
+        logsRequests = []
         flagsRequests = []
+        pushSubscriptionRequests = []
         batchExpectation = XCTestExpectation(description: "\(batchCount) batch requests to occur")
         snapshotExpectation = XCTestExpectation(description: "\(snapshotCount) snapshot requests to occur")
+        logsExpectation = XCTestExpectation(description: "\(logsCount) logs requests to occur")
         flagsExpectation = XCTestExpectation(description: "\(flagsCount ?? 1) flag requests to occur")
         batchExpectationCount = batchCount
         snapshotExpectationCount = snapshotCount
+        logsExpectationCount = logsCount
         flagsExpectationCount = flagsCount
         flagsResponseDelay = 0
         flagsResponseHandler = nil
+        logsResponseHandler = nil
         errorsWhileComputingFlags = false
         return500 = false
         batchResponseHandler = nil
+        returnPushSubscription500 = false
+        pushSubscriptionStatusCode = nil
+        pushSubscriptionStatusHandler = nil
+        pushSubscriptionRetryAfter = nil
+        pushSubscriptionResponseHandler = nil
     }
 
     func parseRequest(_ context: URLRequest, gzip: Bool = true) -> [String: Any]? {

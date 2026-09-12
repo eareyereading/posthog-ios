@@ -29,11 +29,12 @@
     import UIKit
 
     // swiftlint:disable identifier_name
+    /// Convenience helpers for creating and describing survey colors.
     public extension UIColor {
         /**
-         Creates an immuatble UIColor instance specified by a hex string, CSS color name, or nil.
+         Creates an immutable UIColor instance specified by a hex string, CSS color name, or nil.
 
-         - parameter hexString: A case insensitive String? representing a hex or CSS value e.g.
+         - Parameter hex: A case-insensitive CSS color name, `#RGB`, `#RGBA`, `#RRGGBB`, `#RRGGBBAA`, `nil`, or empty string. For example:
 
          - **"abc"**
          - **"abc7"**
@@ -68,7 +69,7 @@
 
          color.hexDescription(true) -> "ff0000aa"
 
-         - Returns: A new string with `String` with the color's hexidecimal value.
+         - Returns: A new `String` with the color's hexadecimal value.
          */
         func hexDescription(_ includeAlpha: Bool = false) -> String {
             guard cgColor.numberOfComponents == 4 else {
@@ -119,11 +120,16 @@
             if hexString.count == 3 || hexString.count == 4 {
                 hexString = hexString.map { "\($0)\($0)" }.joined()
             }
-            let hasAlpha = hexString.count > 7
-            if !hasAlpha {
-                hexString += "ff"
+            switch hexString.count {
+            case 0 ... 6:
+                return hexString + "ff"
+            case 7:
+                return hexString + "0"
+            case 8:
+                return hexString
+            default:
+                return String(hexString.prefix(8))
             }
-            return hexString
         }
 
         /**

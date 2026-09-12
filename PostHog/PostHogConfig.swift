@@ -6,17 +6,21 @@
 //
 import Foundation
 
+/// Callback invoked before an event is persisted or sent.
+///
+/// Return the event (mutated or unchanged) to continue processing, or `nil` to drop it.
+/// Blocks run synchronously on the capture caller's thread and compose in registration order.
+///
+/// - Parameter event: The event about to be queued.
+/// - Returns: The event to queue, or `nil` to drop it.
 public typealias BeforeSendBlock = (PostHogEvent) -> PostHogEvent?
 
-@objc public final class BoxedBeforeSendBlock: NSObject {
-    @objc public let block: BeforeSendBlock
-
-    @objc(block:)
-    public init(block: @escaping BeforeSendBlock) {
-        self.block = block
-    }
-}
-
+/// Runtime configuration for a `PostHogSDK` instance.
+///
+/// Create a config with your project token, mutate any options you need, then pass it to
+/// `PostHogSDK.shared.setup(_:)` or `PostHogSDK.with(_:)`. Options that control queues,
+/// integrations, or resource attributes should be set before setup; later mutations may not
+/// affect already-installed SDK components.
 @objc(PostHogConfig) public class PostHogConfig: NSObject {
     enum Defaults {
         #if os(tvOS)
@@ -29,14 +33,24 @@ public typealias BeforeSendBlock = (PostHogEvent) -> PostHogEvent?
         static let maxBatchSize: Int = 50
         static let flushIntervalSeconds: TimeInterval = 30
         static let maxRetries: Int = 3
+        static let featureFlagRequestMaxRetries: Int = 1
     }
 
-    @objc(PostHogDataMode) public enum PostHogDataMode: Int {
+    /// Network connectivity mode required before queued data may be flushed.
+    @frozen @objc(PostHogDataMode) public enum PostHogDataMode: Int {
+        /// Flush only while the device is connected to Wi-Fi.
         case wifi
+        /// Legacy cellular mode.
+        ///
+        /// Currently behaves the same as `.any`; only `.wifi` applies a stricter flush restriction.
         case cellular
+        /// Flush while any network connection is available.
         case any
     }
 
+    /// PostHog ingestion host used for all SDK network requests.
+    ///
+    /// Defaults to `PostHogConfig.defaultHost` when the initializer host is empty or invalid.
     @objc public let host: URL
 
     /// Your PostHog project token.
@@ -44,32 +58,78 @@ public typealias BeforeSendBlock = (PostHogEvent) -> PostHogEvent?
     /// You can find it at:
     /// https://us.posthog.com/settings/project-details#variables
     ///
-    /// This field was formerly named <c>apiKey</c>.
+    /// This field was formerly named `apiKey`.
     @objc public let projectToken: String
 
-    /// Obsolete alias for <c>projectToken</c>.
+    /// Obsolete alias for `projectToken`.
     @available(*, deprecated, message: "Use projectToken instead. This will be removed in the next major version.")
     @objc public var apiKey: String {
         hedgeLog("apiKey is deprecated and will be removed in the next major version. Use projectToken instead.")
         return projectToken
     }
+    /// Number of queued events that triggers an automatic flush.
+    ///
+    /// Lower values send data sooner but can increase battery and network usage.
+    /// Default: `20` (`5` on tvOS).
     @objc public var flushAt: Int = Defaults.flushAt
+
+    /// Maximum number of events kept in the on-disk queue before older events are dropped.
+    ///
+    /// Default: `1000` (`100` on tvOS).
     @objc public var maxQueueSize: Int = Defaults.maxQueueSize
+
+    /// Maximum number of events included in a single batch request.
+    ///
+    /// Default: `50`.
     @objc public var maxBatchSize: Int = Defaults.maxBatchSize
+
+    /// Interval, in seconds, between periodic queue flush checks.
+    ///
+    /// Lower values deliver events closer to real time but can increase battery usage.
+    /// Default: `30`.
     @objc public var flushIntervalSeconds: TimeInterval = Defaults.flushIntervalSeconds
 
-    /// Maximum number of consecutive flush attempts before the entire queue is
-    /// dropped to avoid infinite retries against a permanently-broken backend.
-    /// Increments on every retriable failure including HTTP 413 cap halving;
-    /// resets on a successful 2xx response. Default 3.
+    /// Maximum number of retries for push-subscription registration failures.
+    ///
+    /// This limit does not apply to event, replay, or log ingestion. Retryable ingestion
+    /// failures retain queued records for later flush triggers, subject to backoff.
+    /// Use `maxQueueSize` for events and replay, and `logs.maxBufferSize` for logs.
+    ///
+    /// Default: `3`.
     @objc public var maxRetries: Int = Defaults.maxRetries
+
+    /// Maximum number of retries for feature flag requests after transient network errors or retryable HTTP responses.
+    /// Defaults to 1. Set to 0 to disable feature flag request retries.
+    @objc public var featureFlagRequestMaxRetries: Int = Defaults.featureFlagRequestMaxRetries
+    /// Required network connectivity mode for flushing queued data.
+    ///
+    /// Only `.wifi` currently restricts flushing; `.cellular` behaves the same as `.any`.
+    /// Default: `.any`.
     @objc public var dataMode: PostHogDataMode = .any
+
+    /// Whether feature flag lookups automatically capture `$feature_flag_called` events.
+    ///
+    /// Individual lookup calls can override this value with their `sendFeatureFlagEvent` parameter.
+    /// Default: `true`.
     @objc public var sendFeatureFlagEvent: Bool = true
+
+    /// Whether feature flags are loaded automatically during SDK setup.
+    ///
+    /// The preload is started automatically during `setup()` and is **not** ordered against
+    /// anything your app does after `setup()`. In particular it can go out before a
+    /// `setPersonPropertiesForFlags(...)` call, in which case the first `/flags` response is evaluated
+    /// without those overrides and an early flag read can see the pre-override value until the reload
+    /// triggered by that call lands. See ``PostHogSDK/setPersonPropertiesForFlags(_:reloadFeatureFlags:)``
+    /// for the ordering contract and how to wait for flags evaluated with your overrides.
+    ///
+    /// Default: `true`.
     @objc public var preloadFeatureFlags: Bool = true
 
-    /// Preload PostHog remote config automatically
+    /// Deprecated no-op for remote config loading.
     ///
-    /// @deprecated Remote config is now always loaded. This option is a no-op and will be removed in a future version.
+    /// Remote config is now always loaded; setting this property has no effect.
+    ///
+    /// - Deprecated: Remote config is always loaded. This option will be removed in a future version.
     @available(*, deprecated, message: "Remote config is now always loaded. This option is a no-op and will be removed in a future version.")
     @objc public var remoteConfig: Bool {
         get { true }
@@ -80,7 +140,24 @@ public typealias BeforeSendBlock = (PostHogEvent) -> PostHogEvent?
         }
     }
 
+    /// Whether the SDK automatically captures application lifecycle events.
+    ///
+    /// When enabled, the SDK records events such as `Application Installed`,
+    /// `Application Updated`, `Application Opened`, and background/foreground transitions.
+    /// Default: `true`.
     @objc public var captureApplicationLifecycleEvents: Bool = true
+
+    /// Automatically captures a `$screen` event whenever a `UIViewController` appears
+    /// (via `viewDidAppear` swizzling).
+    ///
+    /// `$screen_name` stamping on subsequent events is a related effect: any
+    /// successful `screen()` call — whether fired by this auto-capture path **or
+    /// invoked manually** via `PostHogSDK.shared.screen(...)` — caches the screen
+    /// name so it lands as `$screen_name` on every later event the SDK captures.
+    /// To opt out of `$screen_name` stamping entirely, set this to `false` **and**
+    /// avoid calling `screen(...)` manually.
+    ///
+    /// Default: `true`
     @objc public var captureScreenViews: Bool = true
 
     /// Enable method swizzling for SDK functionality that depends on it
@@ -93,18 +170,110 @@ public typealias BeforeSendBlock = (PostHogEvent) -> PostHogEvent?
     /// Default: true
     @objc public var enableSwizzling: Bool = true
 
+    #if os(iOS) || os(macOS)
+        /// Automatically register the device's APNs token with PostHog by swizzling
+        /// `application(_:didRegisterForRemoteNotificationsWithDeviceToken:)`, so Workflows can
+        /// deliver push notifications.
+        ///
+        /// - Note: Requires `enableSwizzling` to be `true`. To register tokens without swizzling, call
+        ///   `PostHogSDK.registerPushNotificationToken(_:)` from your own
+        ///   `application(_:didRegisterForRemoteNotificationsWithDeviceToken:)` implementation.
+        ///   Registration is iOS-only in this version.
+        ///
+        /// Default: true. Set to `false` to opt out.
+        @objc public var capturePushNotificationSubscriptions: Bool = true
+
+        /// Automatically capture a `$push_notification_opened` event when the user taps a **remote** push
+        /// notification, by swizzling `UNUserNotificationCenterDelegate`. Locally-scheduled notifications
+        /// are ignored — call `capturePushNotificationOpened(response:)` yourself to capture those.
+        ///
+        /// - Note: Requires `enableSwizzling` to be `true`. To capture opens without swizzling, call
+        ///   `PostHogSDK.capturePushNotificationOpened(response:)` from your own
+        ///   `userNotificationCenter(_:didReceive:withCompletionHandler:)` implementation.
+        ///
+        /// Default: true. Set to `false` to opt out.
+        ///
+        /// Requires your app to set `UNUserNotificationCenter.current().delegate`. Without one, iOS
+        /// reports the tap to nobody and no open can be captured, in any app state.
+        @objc public var capturePushNotificationOpened: Bool = true
+    #endif
+
+    /// Supplies a signed identity token to attach (as `identity_token`) to push subscription
+    /// register/unregister requests, for projects that enable identity verification on their push
+    /// integration. Invoked with the `distinct_id` and `app_id` the request carries; call `completion`
+    /// **exactly once**, from any thread, with a token minted by your backend — or `nil` to send the
+    /// request without one. The SDK never mints tokens itself: your backend signs an HS256 JWT with
+    /// the project's **secret** API key, claims `sub` = distinct id, `app_id`,
+    /// `aud` = "posthog:push_identity", and an `exp`.
+    ///
+    /// The token is cached in memory per `(distinctId, appId)` and re-requested on identity change, on
+    /// the next launch, and once after a 401 rejection. If `completion` isn't called within ~10s the
+    /// SDK stops waiting and sends the request without an identity token; where your project requires
+    /// identity verification the backend will likely reject it, so make sure your provider always
+    /// completes.
+    ///
+    /// The hook is invoked on a background queue that serializes push-registration work — never on the
+    /// calling thread — and `completion` may be called from any thread. Still return promptly: blocking
+    /// here stalls the SDK's push retry/offline-resume flow (though not your app's main thread).
+    ///
+    /// Default: `nil` (requests carry no identity token).
+    @objc public var pushIdentityProvider: ((_ distinctId: String, _ appId: String, _ completion: @escaping (String?) -> Void) -> Void)?
+
     #if os(iOS) || targetEnvironment(macCatalyst)
-        /// Enable autocapture for iOS
-        /// Default: false
+        /// Enables UIKit element interaction autocapture on iOS and Mac Catalyst.
+        ///
+        /// Requires `enableSwizzling = true`.
+        /// Default: `false`.
         @objc public var captureElementInteractions: Bool = false
         @objc public var captureScrollViewSwipeInteractions: Bool = false
 
-        /// Rage click detection configuration
+        /// Rage click detection configuration.
         @objc public let rageClickConfig: PostHogRageClickConfig = .init()
     #endif
+
+    /// Enables verbose SDK diagnostic logging.
+    ///
+    /// Default: `false`.
     @objc public var debug: Bool = false
+
+    /// Starts the SDK in an opted-out state when set before setup.
+    ///
+    /// While opted out, capture calls are ignored and integrations are not installed.
+    /// Use `PostHogSDK.optIn()` and `PostHogSDK.optOut()` to change the persisted state at runtime.
+    /// Default: `false`.
     @objc public var optOut: Bool = false
+
+    /// Hook used to customize newly generated anonymous IDs.
+    ///
+    /// The SDK passes its generated UUID v7 and stores the UUID returned by this closure.
+    /// Existing stored anonymous IDs are not regenerated.
+    ///
+    /// - Parameter uuid: The SDK-generated anonymous UUID.
+    /// - Returns: The UUID to persist as the anonymous ID.
     @objc public var getAnonymousId: ((UUID) -> UUID) = { uuid in uuid }
+
+    /// Pre-seeded identity and feature-flag state applied during setup, before any
+    /// network request completes.
+    ///
+    /// Set this before calling `setup(_:)` so events captured synchronously during
+    /// initialization (`Application Installed` / `Application Updated`, pre-identify
+    /// lifecycle events) carry a caller-controlled `$distinct_id` rather than the
+    /// SDK-generated UUID, and so feature flag reads return caller-provided values
+    /// before the first `/flags` response. Mirrors the [`bootstrap` option in `posthog-js`](https://posthog.com/docs/feature-flags/bootstrapping).
+    ///
+    /// Identity is seeded on a fresh install. For a returning user, an identified bootstrap
+    /// (`isIdentifiedId == true`) reconciles against the stored identity — upgrading a
+    /// matching anonymous ID to identified, merging a differing anonymous user into the
+    /// bootstrapped ID, or preserving a different already-identified user. An anonymous
+    /// bootstrap is ignored once an anonymous ID is persisted.
+    ///
+    /// Feature flags are applied on every initialization and take precedence over the
+    /// persisted flag cache. They are a temporary base layer: the first complete `/flags`
+    /// response replaces them entirely, while a partial or errored response overlays only
+    /// the keys it recomputed.
+    ///
+    /// Defaults to `nil` (use the SDK-generated UUID and no bootstrapped flags).
+    @objc public var bootstrap: PostHogBootstrapConfig?
 
     /// Flag to reuse the anonymous Id between `reset()` and next `identify()` calls
     ///
@@ -138,10 +307,12 @@ public typealias BeforeSendBlock = (PostHogEvent) -> PostHogEvent?
     /// When enabled, the SDK will automatically set the following person properties:
     /// - $app_version: App version from bundle
     /// - $app_build: App build number from bundle
+    /// - $app_namespace: App bundle identifier
     /// - $os_name: Operating system name (iOS, macOS, etc.)
     /// - $os_version: Operating system version
     /// - $device_type: Device type (Mobile, Tablet, Desktop, etc.)
-    /// - $locale: User's current locale
+    /// - $lib: SDK name
+    /// - $lib_version: SDK version
     ///
     /// This helps ensure feature flags that rely on these properties work correctly
     /// without waiting for server-side processing of identify() calls.
@@ -166,8 +337,9 @@ public typealias BeforeSendBlock = (PostHogEvent) -> PostHogEvent?
     /// Default: nil (all flags are evaluated)
     @objc public var evaluationContexts: [String]?
 
-    /// Evaluation environments for feature flags.
-    /// @deprecated Use evaluationContexts instead. This property will be removed in a future version.
+    /// Deprecated alias for `evaluationContexts`.
+    ///
+    /// - Deprecated: Use `evaluationContexts` instead. This property will be removed in a future version.
     @available(*, deprecated, message: "Use evaluationContexts instead. This property will continue to work but will be removed in a future version.")
     @objc public var evaluationEnvironments: [String]? {
         get { evaluationContexts }
@@ -184,11 +356,15 @@ public typealias BeforeSendBlock = (PostHogEvent) -> PostHogEvent?
     /// Default: nil
     @objc public var appGroupIdentifier: String?
 
-    /// Internal
-    /// Do not modify it, this flag is read and updated by the SDK via feature flags
+    /// Session replay snapshot endpoint path.
+    ///
+    /// - Warning: This value is managed by the SDK from remote configuration and should not
+    ///   be changed by application code.
     @objc public var snapshotEndpoint: String = "/s/"
 
-    /// or EU Host: 'https://eu.i.posthog.com'
+    /// Default PostHog ingestion host for US Cloud projects.
+    ///
+    /// Use `"https://eu.i.posthog.com"` for EU Cloud projects.
     public static let defaultHost: String = "https://us.i.posthog.com"
 
     #if os(iOS)
@@ -222,6 +398,10 @@ public typealias BeforeSendBlock = (PostHogEvent) -> PostHogEvent?
     /// See known limitations: https://posthog.com/docs/error-tracking/installation/ios#limitations
     @objc public let errorTrackingConfig: PostHogErrorTrackingConfig = .init()
 
+    /// Configuration for the logs subsystem (manual `captureLog` capture).
+    /// Mutate fields on `config.logs` before calling `PostHogSDK.setup(_:)`.
+    @objc public let logs: PostHogLogsConfig = .init()
+
     /// Enable mobile surveys
     ///
     /// Default: true
@@ -238,6 +418,10 @@ public typealias BeforeSendBlock = (PostHogEvent) -> PostHogEvent?
         set { setSurveys(newValue) }
     }
 
+    /// Configuration for mobile survey presentation and localization.
+    ///
+    /// Mutate fields on `config.surveysConfig` or replace this object before calling setup.
+    /// Available on iOS 15 and later.
     @available(iOS 15.0, *)
     @available(watchOS, unavailable, message: "Surveys are only available on iOS 15+")
     @available(macOS, unavailable, message: "Surveys are only available on iOS 15+")
@@ -253,22 +437,29 @@ public typealias BeforeSendBlock = (PostHogEvent) -> PostHogEvent?
     /// Useful for testing, proxying, or custom network configurations
     @objc public var urlSessionConfiguration: URLSessionConfiguration?
 
+    /// Custom headers to send with every request to the PostHog API.
+    /// Useful for reverse-proxy setups that require authentication, e.g. an `Authorization` header.
+    /// Read once when the SDK is set up; changes after setup are ignored.
+    @objc public var requestHeaders: [String: String]?
+
     // only internal
     var disableReachabilityForTesting: Bool = false
     var disableQueueTimerForTesting: Bool = false
     var disableFlushOnBackgroundForTesting: Bool = false
     var disableRemoteConfigForTesting: Bool = false
-    // internal
+    /// Storage manager used by this configuration.
+    ///
+    /// - Warning: This is an SDK extension point used internally to share identity storage
+    ///   with SDK integrations and tests. Application code should not normally replace it.
     public var storageManager: PostHogStorageManager?
 
     private static func normalizeProjectToken(_ projectToken: String) -> String {
-        let normalizedProjectToken = projectToken.trimmingCharacters(in: .whitespacesAndNewlines)
-        if normalizedProjectToken.isEmpty {
-            hedgeLog("Either projectToken or apiKey must be provided.")
-        }
-        return normalizedProjectToken
+        projectToken.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    /// Creates a configuration using the default PostHog host.
+    ///
+    /// - Parameter projectToken: Your PostHog project token. Leading and trailing whitespace is trimmed.
     @objc(projectToken:)
     public init(
         projectToken: String
@@ -277,6 +468,12 @@ public typealias BeforeSendBlock = (PostHogEvent) -> PostHogEvent?
         host = URL(string: PostHogConfig.defaultHost)!
     }
 
+    /// Creates a configuration with an explicit PostHog ingestion host.
+    ///
+    /// - Parameters:
+    ///   - projectToken: Your PostHog project token. Leading and trailing whitespace is trimmed.
+    ///   - host: PostHog ingestion host, for example `"https://us.i.posthog.com"` or
+    ///     `"https://eu.i.posthog.com"`. Empty or invalid values fall back to `defaultHost`.
     @objc(projectToken:host:)
     public init(
         projectToken: String,
@@ -288,6 +485,10 @@ public typealias BeforeSendBlock = (PostHogEvent) -> PostHogEvent?
         self.host = URL(string: normalizedHost.isEmpty ? PostHogConfig.defaultHost : normalizedHost) ?? URL(string: PostHogConfig.defaultHost)!
     }
 
+    /// Creates a configuration using the deprecated `apiKey` name.
+    ///
+    /// - Parameter apiKey: Your PostHog project token.
+    /// - Deprecated: Use `init(projectToken:)` instead.
     @available(*, deprecated, message: "Use init(projectToken:) instead. This will be removed in the next major version.")
     @objc(apiKey:)
     public convenience init(
@@ -297,6 +498,12 @@ public typealias BeforeSendBlock = (PostHogEvent) -> PostHogEvent?
         self.init(projectToken: apiKey)
     }
 
+    /// Creates a configuration using the deprecated `apiKey` name and an explicit host.
+    ///
+    /// - Parameters:
+    ///   - apiKey: Your PostHog project token.
+    ///   - host: PostHog ingestion host. Empty or invalid values fall back to `defaultHost`.
+    /// - Deprecated: Use `init(projectToken:host:)` instead.
     @available(*, deprecated, message: "Use init(projectToken:host:) instead. This will be removed in the next major version.")
     @objc(apiKey:host:)
     public convenience init(
@@ -350,8 +557,32 @@ public typealias BeforeSendBlock = (PostHogEvent) -> PostHogEvent?
             }
         #endif
 
+        #if os(iOS) || os(macOS)
+            if #available(iOS 14.0, macOS 11.0, *) {
+                // Token registration is iOS-only in v1 (the backend rejects `macos`); opened-capture
+                // works on both platforms.
+                #if os(iOS)
+                    if capturePushNotificationSubscriptions {
+                        integrations.append(PostHogPushNotificationSubscriptionIntegration())
+                    }
+                #endif
+                if installsPushNotificationOpenIntegration {
+                    integrations.append(PostHogPushNotificationOpenIntegration())
+                }
+            }
+        #endif
+
         return integrations
     }
+
+    #if os(iOS) || os(macOS)
+        /// `setup()`'s prewarm-discard gate is the negation of this, and the discard is the only thing
+        /// that releases a prewarm the config did not want. Both read this property so a new reason
+        /// not to install cannot be added on one side only.
+        var installsPushNotificationOpenIntegration: Bool {
+            capturePushNotificationOpened && enableSwizzling && !optOut
+        }
+    #endif
 
     var _surveys: Bool = true // swiftlint:disable:this identifier_name
     private func setSurveys(_ value: Bool) {
@@ -373,30 +604,36 @@ public typealias BeforeSendBlock = (PostHogEvent) -> PostHogEvent?
 
     /// Hook that allows to sanitize the event
     /// The hook is called before the event is cached or sent over the wire
-    private var beforeSend: BeforeSendBlock = { $0 }
+    private var beforeSend = BeforeSendChain<PostHogEvent>()
 
-    private static func buildBeforeSendBlock(_ blocks: [BeforeSendBlock]) -> BeforeSendBlock {
-        { event in
-            blocks.reduce(event) { event, block in
-                event.flatMap(block)
-            }
-        }
-    }
-
+    /// Replaces the event `beforeSend` chain with the provided blocks.
+    ///
+    /// Blocks run synchronously in array order before an event is cached or sent. Returning
+    /// `nil` from any block drops the event and skips the remaining blocks.
+    ///
+    /// - Parameter blocks: Ordered callbacks that can mutate or drop events.
     public func setBeforeSend(_ blocks: [BeforeSendBlock]) {
-        beforeSend = Self.buildBeforeSendBlock(blocks)
+        beforeSend.set(blocks)
     }
 
+    /// Replaces the event `beforeSend` chain with the provided blocks.
+    ///
+    /// - Parameter blocks: Ordered callbacks that can mutate or drop events.
     public func setBeforeSend(_ blocks: BeforeSendBlock...) {
         setBeforeSend(blocks)
     }
 
-    @available(*, unavailable, message: "Use setBeforeSend(_ blocks: BeforeSendBlock...) instead")
+    /// Replaces the event `beforeSend` chain from Objective-C boxed callbacks.
+    ///
+    /// - Parameter blocks: Ordered Objective-C callback boxes.
+    @available(swift, obsoleted: 1.0, message: "Use setBeforeSend(_ blocks: BeforeSendBlock...) instead")
     @objc public func setBeforeSend(_ blocks: [BoxedBeforeSendBlock]) {
-        setBeforeSend(blocks.map(\.block))
+        setBeforeSend(blocks.map { box in
+            { event in box.invokeSafely(with: event) }
+        })
     }
 
     func runBeforeSend(_ event: PostHogEvent) -> PostHogEvent? {
-        beforeSend(event)
+        beforeSend.run(event)
     }
 }

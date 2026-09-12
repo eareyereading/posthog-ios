@@ -5,6 +5,7 @@
 //  Created by Yiannis Josephides on 20/01/2025.
 //
 
+import OHHTTPStubs
 @testable import PostHog
 import Testing
 import XCTest
@@ -29,6 +30,14 @@ enum PostHogFeatureFlagsTest {
 
         var server: MockPostHogServer!
 
+        // SDKs created per test, closed in deinit so their queues/timers/observers don't leak
+        // across the run and starve the background thread pool. close() is idempotent.
+        var trackedSuts: [PostHogSDK] = []
+        func track(_ sut: PostHogSDK) -> PostHogSDK {
+            trackedSuts.append(sut)
+            return sut
+        }
+
         init() {
             server = MockPostHogServer(version: 4)
             server.start()
@@ -38,6 +47,7 @@ enum PostHogFeatureFlagsTest {
         }
 
         deinit {
+            trackedSuts.forEach { $0.close() }
             server.stop()
             server = nil
         }
@@ -280,7 +290,7 @@ enum PostHogFeatureFlagsTest {
     class TestPersonAndGroupPropertiesForFlags: BaseTestClass {
         @Test("Person properties are stored and retrieved correctly")
         func storeAndRetrievePersonProperties() async {
-            let sut = PostHogSDK.with(config)
+            let sut = track(PostHogSDK.with(config))
 
             // Enable person processing by identifying
             sut.identify("test_user")
@@ -327,7 +337,7 @@ enum PostHogFeatureFlagsTest {
 
         @Test("Person properties are additive")
         func personPropertiesAreAdditive() async {
-            let sut = PostHogSDK.with(config)
+            let sut = track(PostHogSDK.with(config))
 
             // Set first batch of properties
             sut.setPersonPropertiesForFlags(["property1": "value1", "shared": "original"])
@@ -365,7 +375,7 @@ enum PostHogFeatureFlagsTest {
 
         @Test("Reset person properties clears all properties")
         func resetPersonPropertiesClearsAll() async {
-            let sut = PostHogSDK.with(config)
+            let sut = track(PostHogSDK.with(config))
 
             // Set some properties
             sut.setPersonPropertiesForFlags(["property1": "value1", "property2": "value2"])
@@ -401,7 +411,7 @@ enum PostHogFeatureFlagsTest {
 
         @Test("Group properties are stored and retrieved correctly")
         func storeAndRetrieveGroupProperties() async {
-            let sut = PostHogSDK.with(config)
+            let sut = track(PostHogSDK.with(config))
 
             let properties = [
                 "plan": "enterprise",
@@ -447,7 +457,7 @@ enum PostHogFeatureFlagsTest {
 
         @Test("Multiple group types are handled correctly")
         func multipleGroupTypesHandled() async {
-            let sut = PostHogSDK.with(config)
+            let sut = track(PostHogSDK.with(config))
 
             // Set properties for different group types
             sut.setGroupPropertiesForFlags("organization", properties: ["plan": "enterprise"])
@@ -482,7 +492,7 @@ enum PostHogFeatureFlagsTest {
 
         @Test("Reset group properties for specific type")
         func resetGroupPropertiesSpecificType() async {
-            let sut = PostHogSDK.with(config)
+            let sut = track(PostHogSDK.with(config))
 
             // Set properties for multiple group types
             sut.setGroupPropertiesForFlags("organization", properties: ["plan": "enterprise"])
@@ -520,7 +530,7 @@ enum PostHogFeatureFlagsTest {
 
         @Test("Reset all group properties")
         func resetAllGroupProperties() async {
-            let sut = PostHogSDK.with(config)
+            let sut = track(PostHogSDK.with(config))
 
             // Set properties for multiple group types
             sut.setGroupPropertiesForFlags("organization", properties: ["plan": "enterprise"])
@@ -552,7 +562,7 @@ enum PostHogFeatureFlagsTest {
 
         @Test("Both person and group properties sent together")
         func bothPersonAndGroupPropertiesSent() async {
-            let sut = PostHogSDK.with(config)
+            let sut = track(PostHogSDK.with(config))
 
             // Set both types of properties
             sut.setPersonPropertiesForFlags(["user_plan": "premium"])
@@ -595,7 +605,7 @@ enum PostHogFeatureFlagsTest {
 
         @Test("Capture with userProperties automatically sets person properties for flags")
         func captureWithUserPropertiesAutomaticallySetsPersonPropertiesForFlags() async {
-            let sut = PostHogSDK.with(config)
+            let sut = track(PostHogSDK.with(config))
 
             // Enable person processing
             sut.identify("test_user")
@@ -632,7 +642,7 @@ enum PostHogFeatureFlagsTest {
 
         @Test("Group with groupProperties automatically sets group properties for flags")
         func groupWithGroupPropertiesAutomaticallySetsGroupPropertiesForFlags() async {
-            let sut = PostHogSDK.with(config)
+            let sut = track(PostHogSDK.with(config))
 
             // Enable person processing
             sut.identify("test_user")
@@ -672,7 +682,7 @@ enum PostHogFeatureFlagsTest {
     class TestGetFeatureFlagResult: BaseTestClass {
         @Test("returns result for enabled boolean flag")
         func returnsResultForEnabledBoolFlag() async {
-            let sut = PostHogSDK.with(config)
+            let sut = track(PostHogSDK.with(config))
 
             await withCheckedContinuation { continuation in
                 sut.reloadFeatureFlags {
@@ -690,7 +700,7 @@ enum PostHogFeatureFlagsTest {
 
         @Test("returns result for string variant flag")
         func returnsResultForVariantFlag() async {
-            let sut = PostHogSDK.with(config)
+            let sut = track(PostHogSDK.with(config))
 
             await withCheckedContinuation { continuation in
                 sut.reloadFeatureFlags {
@@ -708,7 +718,7 @@ enum PostHogFeatureFlagsTest {
 
         @Test("returns result for disabled flag")
         func returnsResultForDisabledFlag() async {
-            let sut = PostHogSDK.with(config)
+            let sut = track(PostHogSDK.with(config))
 
             await withCheckedContinuation { continuation in
                 sut.reloadFeatureFlags {
@@ -726,7 +736,7 @@ enum PostHogFeatureFlagsTest {
 
         @Test("returns nil for non-existent flag")
         func returnsNilForNonExistentFlag() async {
-            let sut = PostHogSDK.with(config)
+            let sut = track(PostHogSDK.with(config))
 
             await withCheckedContinuation { continuation in
                 sut.reloadFeatureFlags {
@@ -741,7 +751,7 @@ enum PostHogFeatureFlagsTest {
 
         @Test("includes payload in result")
         func includesPayloadInResult() async {
-            let sut = PostHogSDK.with(config)
+            let sut = track(PostHogSDK.with(config))
 
             await withCheckedContinuation { continuation in
                 sut.reloadFeatureFlags {
@@ -764,7 +774,7 @@ enum PostHogFeatureFlagsTest {
         func sendsEventByDefault() async throws {
             config.sendFeatureFlagEvent = true
             config.flushAt = 1
-            let sut = PostHogSDK.with(config)
+            let sut = track(PostHogSDK.with(config))
 
             await withCheckedContinuation { continuation in
                 sut.reloadFeatureFlags {
@@ -791,7 +801,7 @@ enum PostHogFeatureFlagsTest {
         func respectsSendEventParameterFalse() async {
             config.sendFeatureFlagEvent = true
             config.flushAt = 1
-            let sut = PostHogSDK.with(config)
+            let sut = track(PostHogSDK.with(config))
 
             await withCheckedContinuation { continuation in
                 sut.reloadFeatureFlags {
@@ -818,7 +828,7 @@ enum PostHogFeatureFlagsTest {
 
         @Test("getFeatureFlag returns consistent values with getFeatureFlagResult")
         func getFeatureFlagReturnsSameValue() async {
-            let sut = PostHogSDK.with(config)
+            let sut = track(PostHogSDK.with(config))
 
             await withCheckedContinuation { continuation in
                 sut.reloadFeatureFlags {
@@ -835,6 +845,99 @@ enum PostHogFeatureFlagsTest {
             let stringResult = sut.getFeatureFlagResult("string-value", sendFeatureFlagEvent: false)
             let stringValue = sut.getFeatureFlag("string-value", sendFeatureFlagEvent: false)
             #expect(stringResult?.variant == stringValue as? String)
+
+            sut.close()
+        }
+    }
+
+    @Suite("Test getAllFeatureFlags")
+    class TestGetAllFeatureFlags: BaseTestClass {
+        @Test("returns nil before flags are loaded")
+        func returnsNilBeforeLoad() {
+            let sut = track(PostHogSDK.with(config))
+            #expect(sut.getAllFeatureFlags() == nil)
+            sut.close()
+        }
+
+        @Test("returns all loaded flags, including disabled ones")
+        func returnsAllFlagsIncludingDisabled() async {
+            let sut = track(PostHogSDK.with(config))
+            await withCheckedContinuation { continuation in
+                sut.reloadFeatureFlags { continuation.resume() }
+            }
+
+            let all = sut.getAllFeatureFlags()
+            #expect(all != nil)
+
+            // Order is not guaranteed, so key by flag key.
+            let byKey = Dictionary(uniqueKeysWithValues: (all ?? []).map { ($0.key, $0) })
+
+            // Enabled boolean flag
+            #expect(byKey["bool-value"]?.enabled == true)
+            #expect(byKey["bool-value"]?.variant == nil)
+
+            // Multivariate flag carries its variant
+            #expect(byKey["string-value"]?.enabled == true)
+            #expect(byKey["string-value"]?.variant == "test")
+
+            // Disabled flag is INCLUDED as enabled=false (not filtered out) — matches Android.
+            #expect(byKey["disabled-flag"] != nil, "disabled flags should be included in the result")
+            #expect(byKey["disabled-flag"]?.enabled == false)
+            #expect(byKey["disabled-flag"]?.variant == nil)
+
+            sut.close()
+        }
+
+        @Test("decodes payloads (object and scalar)")
+        func decodesPayloads() async {
+            let sut = track(PostHogSDK.with(config))
+            await withCheckedContinuation { continuation in
+                sut.reloadFeatureFlags { continuation.resume() }
+            }
+
+            let byKey = Dictionary(uniqueKeysWithValues: (sut.getAllFeatureFlags() ?? []).map { ($0.key, $0) })
+
+            // Scalar payload parsed via .fragmentsAllowed
+            #expect(byKey["number-value"]?.payload as? Int == 2)
+            // Object payload parsed to a dictionary
+            #expect(byKey["payload-json"]?.payload as? [String: String] == ["foo": "bar"])
+
+            sut.close()
+        }
+
+        @Test("each result matches getFeatureFlagResult for that key")
+        func matchesSingleKeyResult() async {
+            let sut = track(PostHogSDK.with(config))
+            await withCheckedContinuation { continuation in
+                sut.reloadFeatureFlags { continuation.resume() }
+            }
+
+            for flag in sut.getAllFeatureFlags() ?? [] {
+                let single = sut.getFeatureFlagResult(flag.key, sendFeatureFlagEvent: false)
+                #expect(flag.enabled == single?.enabled, "enabled mismatch for \(flag.key)")
+                #expect(flag.variant == single?.variant, "variant mismatch for \(flag.key)")
+            }
+
+            sut.close()
+        }
+
+        @Test("does not send $feature_flag_called")
+        func doesNotSendEvent() async {
+            config.sendFeatureFlagEvent = true
+            config.flushAt = 1
+            let sut = track(PostHogSDK.with(config))
+            await withCheckedContinuation { continuation in
+                sut.reloadFeatureFlags { continuation.resume() }
+            }
+
+            server.reset(batchCount: 1)
+
+            _ = sut.getAllFeatureFlags()
+
+            sut.flush()
+            let events = getBatchedEvents(server, timeout: 0.5, failIfNotCompleted: false)
+            let ffEvent = events.first { $0.event == "$feature_flag_called" }
+            #expect(ffEvent == nil, "getAllFeatureFlags must not emit $feature_flag_called")
 
             sut.close()
         }
@@ -918,7 +1021,7 @@ enum PostHogFeatureFlagsTest {
         func evaluationContextsIncludedInRequest() async {
             // Configure evaluation contexts
             config.evaluationContexts = ["production", "web", "checkout"]
-            let sut = PostHogSDK.with(config)
+            let sut = track(PostHogSDK.with(config))
 
             // Enable person processing
             sut.identify("test_user")
@@ -958,7 +1061,7 @@ enum PostHogFeatureFlagsTest {
         func emptyEvaluationContextsNotIncluded() async {
             // Configure with empty evaluation contexts
             config.evaluationContexts = []
-            let sut = PostHogSDK.with(config)
+            let sut = track(PostHogSDK.with(config))
 
             // Enable person processing
             sut.identify("test_user")
@@ -989,7 +1092,7 @@ enum PostHogFeatureFlagsTest {
         @Test("Nil evaluation contexts not included in request")
         func nilEvaluationContextsNotIncluded() async {
             // Don't set evaluation contexts (leave as nil)
-            let sut = PostHogSDK.with(config)
+            let sut = track(PostHogSDK.with(config))
 
             // Enable person processing
             sut.identify("test_user")
@@ -1019,7 +1122,7 @@ enum PostHogFeatureFlagsTest {
 
         @Test("Can update evaluation contexts after initialization")
         func canUpdateEvaluationContexts() async {
-            let sut = PostHogSDK.with(config)
+            let sut = track(PostHogSDK.with(config))
 
             // Enable person processing
             sut.identify("test_user")
@@ -1071,7 +1174,7 @@ enum PostHogFeatureFlagsTest {
         func deprecatedEvaluationEnvironmentsStillWorks() async {
             // Use the deprecated property
             config.evaluationEnvironments = ["production", "api"]
-            let sut = PostHogSDK.with(config)
+            let sut = track(PostHogSDK.with(config))
 
             // Verify the deprecated property maps to evaluationContexts
             #expect(config.evaluationContexts?.count == 2, "Expected evaluationContexts to be set via deprecated property")
@@ -1114,6 +1217,409 @@ enum PostHogFeatureFlagsTest {
             #expect(evaluationContexts.count == 2, "Expected 2 evaluation contexts")
             #expect(evaluationContexts.contains("production"), "Expected 'production' in evaluation contexts")
             #expect(evaluationContexts.contains("api"), "Expected 'api' in evaluation contexts")
+        }
+    }
+
+    @Suite("Test Bootstrap Feature Flags")
+    class TestBootstrapFeatureFlags: BaseTestClass {
+        private func bootstrapConfig(
+            featureFlags: [String: Any],
+            featureFlagPayloads: [String: Any]? = nil
+        ) -> PostHogConfig {
+            let c = PostHogConfig(projectToken: "test_project_token", host: "http://localhost:9001")
+            c.preloadFeatureFlags = false
+            c.disableReachabilityForTesting = true
+            c.disableQueueTimerForTesting = true
+            c.disableFlushOnBackgroundForTesting = true
+            c.disableRemoteConfigForTesting = true
+            c.bootstrap = PostHogBootstrapConfig(
+                featureFlags: featureFlags,
+                featureFlagPayloads: featureFlagPayloads
+            )
+            return c
+        }
+
+        private func freshStorage(_ config: PostHogConfig) -> PostHogStorage {
+            let storage = PostHogStorage(config)
+            storage.reset()
+            return storage
+        }
+
+        @Test("Bootstrapped flags are readable immediately after setup")
+        func servesBootstrappedFlagsBeforeLoad() {
+            let config = bootstrapConfig(featureFlags: ["beta-ui": true])
+            let sut = getSut(storage: freshStorage(config), config: config)
+
+            #expect(sut.getFeatureFlag("beta-ui") as? Bool == true)
+        }
+
+        @Test("Non-serializable bootstrapped values are dropped, not crashed on")
+        func sanitizesInvalidBootstrappedValues() {
+            // A non-JSON-serializable value (NaN) reaching the flag cache would raise an
+            // uncatchable NSException in JSONSerialization; setup must drop it, not crash.
+            let config = bootstrapConfig(
+                featureFlags: ["good": true, "bad": Double.nan],
+                featureFlagPayloads: ["good": ["k": "v"], "bad": ["n": Double.infinity]]
+            )
+            let sut = getSut(storage: freshStorage(config), config: config)
+
+            #expect(sut.getFeatureFlag("good") as? Bool == true)
+            #expect(sut.getFeatureFlag("bad") == nil)
+            #expect(sut.getFeatureFlagPayload("bad") == nil)
+        }
+
+        @Test("Bootstrapped payload is served with its flag")
+        func servesBootstrappedPayload() {
+            let config = bootstrapConfig(
+                featureFlags: ["beta-ui": "variant-a"],
+                featureFlagPayloads: ["beta-ui": ["color": "blue"]]
+            )
+            let sut = getSut(storage: freshStorage(config), config: config)
+
+            #expect(sut.getFeatureFlag("beta-ui") as? String == "variant-a")
+            #expect(sut.getFeatureFlagPayload("beta-ui") as? [String: String] == ["color": "blue"])
+        }
+
+        @Test("Loaded flags override bootstrapped values")
+        func loadedFlagsOverrideBootstrap() async {
+            let config = bootstrapConfig(featureFlags: ["bool-value": "bootstrapped-variant"])
+            let sut = getSut(storage: freshStorage(config), config: config)
+
+            // Before load: the bootstrapped value wins
+            #expect(sut.getFeatureFlag("bool-value") as? String == "bootstrapped-variant")
+
+            await withCheckedContinuation { continuation in
+                sut.loadFeatureFlags(distinctId: "distinctId", anonymousId: "anonymousId", groups: [:], callback: { _ in
+                    continuation.resume()
+                })
+            }
+
+            // After load: the server value (true) replaces the bootstrapped one
+            #expect(sut.getFeatureFlag("bool-value") as? Bool == true)
+        }
+
+        @Test("A disabled (false) bootstrap flag is not served")
+        func disabledBootstrapFlagNotServed() {
+            let config = bootstrapConfig(featureFlags: ["enabled": true, "disabled": false, "variant": "v1"])
+            let sut = getSut(storage: freshStorage(config), config: config)
+
+            // Only enabled flags (truthy values) are served, matching posthog-js.
+            #expect(sut.getFeatureFlag("enabled") as? Bool == true)
+            #expect(sut.getFeatureFlag("variant") as? String == "v1")
+            #expect(sut.getFeatureFlag("disabled") == nil)
+        }
+
+        @Test("A payload for a disabled bootstrap flag is not served")
+        func disabledBootstrapPayloadNotServed() {
+            let config = bootstrapConfig(
+                featureFlags: ["enabled": "v1", "disabled": false],
+                featureFlagPayloads: ["enabled": ["k": "v"], "disabled": ["k": "x"]]
+            )
+            let sut = getSut(storage: freshStorage(config), config: config)
+
+            #expect(sut.getFeatureFlagPayload("enabled") as? [String: String] == ["k": "v"])
+            #expect(sut.getFeatureFlagPayload("disabled") == nil)
+        }
+
+        @Test("A complete flags load drops bootstrapped-only keys")
+        func completeLoadDropsBootstrappedOnlyKeys() async {
+            let config = bootstrapConfig(featureFlags: ["bool-value": true, "legacy": true])
+            let sut = getSut(storage: freshStorage(config), config: config)
+
+            // Before load: both bootstrapped keys are served
+            #expect(sut.getFeatureFlag("legacy") as? Bool == true)
+
+            await withCheckedContinuation { continuation in
+                sut.loadFeatureFlags(distinctId: "distinctId", anonymousId: "anonymousId", groups: [:], callback: { _ in
+                    continuation.resume()
+                })
+            }
+
+            // A complete /flags response replaces the served flags: bootstrapped-only "legacy" is
+            // dropped, and the overlapping key reflects the loaded value.
+            #expect(sut.getFeatureFlag("legacy") == nil)
+            #expect(sut.getFeatureFlag("bool-value") as? Bool == true)
+        }
+
+        @Test("Bootstrap is first-session only: not resurrected after reset")
+        func bootstrapNotReappliedAfterReset() async {
+            let config = bootstrapConfig(featureFlags: ["legacy": true])
+            let sut = getSut(storage: freshStorage(config), config: config)
+
+            func load() async {
+                await withCheckedContinuation { continuation in
+                    sut.loadFeatureFlags(distinctId: "distinctId", anonymousId: "anonymousId", groups: [:], callback: { _ in
+                        continuation.resume()
+                    })
+                }
+            }
+
+            // Bootstrap serves "legacy" before any load
+            #expect(sut.getFeatureFlag("legacy") as? Bool == true)
+
+            await load()
+            #expect(sut.hasLoadedFeatureFlagsFromRemote() == true)
+
+            // reset() clears the retained bootstrap and the loaded-from-remote latch
+            sut.clear()
+            #expect(sut.hasLoadedFeatureFlagsFromRemote() == false)
+
+            // A reload for the new (post-reset) user must NOT re-inject the bootstrapped-only key
+            await load()
+            #expect(sut.getFeatureFlag("legacy") == nil)
+        }
+
+        @Test("Bootstrap seed fires the flags-loaded notification")
+        @MainActor
+        func bootstrapSeedFiresFlagsLoaded() async {
+            let config = bootstrapConfig(featureFlags: ["beta-ui": true])
+            let flagsLoaded = AsyncLatch()
+            var receivedFlags: [String: Any]?
+
+            // @MainActor keeps this deterministic: init fires the notify on the main queue, which can't
+            // run until we suspend at `await` below, so the subscription is always registered first.
+            let sut = getSut(storage: freshStorage(config), config: config)
+            let token = sut.onFeatureFlagsLoaded.subscribe { flags in
+                receivedFlags = flags
+                flagsLoaded.signal()
+            }
+
+            await flagsLoaded.wait()
+
+            #expect(receivedFlags?["beta-ui"] as? Bool == true)
+            _ = token
+        }
+    }
+
+    @Suite("Test Bootstrap Feature Flag Reporting")
+    class TestBootstrapFeatureFlagReporting: BaseTestClass {
+        private func enrichmentConfig(
+            featureFlags: [String: Any],
+            featureFlagPayloads: [String: Any]? = nil
+        ) -> PostHogConfig {
+            let c = PostHogConfig(projectToken: "test_project_token", host: "http://localhost:9001")
+            c.preloadFeatureFlags = false
+            c.disableReachabilityForTesting = true
+            c.disableQueueTimerForTesting = true
+            c.disableFlushOnBackgroundForTesting = true
+            c.disableRemoteConfigForTesting = true
+            c.captureApplicationLifecycleEvents = false
+            c.captureScreenViews = false
+            c.sendFeatureFlagEvent = true
+            c.flushAt = 1
+            c.bootstrap = PostHogBootstrapConfig(
+                featureFlags: featureFlags,
+                featureFlagPayloads: featureFlagPayloads
+            )
+            return c
+        }
+
+        @Test("$feature_flag_called reports bootstrap use before a flags response")
+        func reportsUsedBootstrapTrueBeforeLoad() async throws {
+            let config = enrichmentConfig(
+                featureFlags: ["beta-ui": true],
+                featureFlagPayloads: ["beta-ui": ["color": "blue"]]
+            )
+            let sut = track(PostHogSDK.with(config))
+
+            server.reset(batchCount: 1)
+
+            _ = sut.getFeatureFlag("beta-ui")
+            sut.flush()
+
+            let events = try await getServerEvents(server)
+            let event = events.first {
+                $0.event == "$feature_flag_called" && $0.properties["$feature_flag"] as? String == "beta-ui"
+            }
+            #expect(event != nil)
+            #expect(event?.properties["$used_bootstrap_value"] as? Bool == true)
+            #expect(event?.properties["$feature_flag_bootstrapped_response"] as? Bool == true)
+            #expect(event?.properties["$feature_flag_bootstrapped_payload"] as? [String: String] == ["color": "blue"])
+
+            sut.close()
+        }
+
+        @Test("$feature_flag_called reports bootstrap not used after a flags response")
+        func reportsUsedBootstrapFalseAfterLoad() async throws {
+            let config = enrichmentConfig(featureFlags: ["beta-ui": true])
+            let sut = track(PostHogSDK.with(config))
+
+            // Receive a /flags response first
+            await withCheckedContinuation { continuation in
+                sut.reloadFeatureFlags {
+                    continuation.resume()
+                }
+            }
+
+            server.reset(batchCount: 1)
+
+            _ = sut.getFeatureFlag("beta-ui")
+            sut.flush()
+
+            let events = try await getServerEvents(server)
+            let event = events.first {
+                $0.event == "$feature_flag_called" && $0.properties["$feature_flag"] as? String == "beta-ui"
+            }
+            #expect(event != nil)
+            #expect(event?.properties["$used_bootstrap_value"] as? Bool == false)
+            // still reports the originally-bootstrapped response for the key
+            #expect(event?.properties["$feature_flag_bootstrapped_response"] as? Bool == true)
+
+            sut.close()
+        }
+    }
+
+    @Suite("Test concurrent flag reload coalescing", .timeLimit(.minutes(1)))
+    class TestConcurrentFlagReloads: BaseTestClass {
+        /// Held by the first `/flags` response until the test has issued the reloads that must
+        /// coalesce behind it. Wall-clock delays leave that window to chance; this makes it certain.
+        private let firstResponseGate = DispatchSemaphore(value: 0)
+
+        /// Stubs `/flags` so that `override-flag` is only enabled when the request body actually
+        /// carried `app_version_semver`. That makes a callback resolved against a real response
+        /// distinguishable from one resolved against disk-cached, pre-override values.
+        private func stubFlagsRequiringOverride(delay: TimeInterval, gateFirstResponse: Bool = false) {
+            server.flagsResponseDelay = delay
+            let gate = firstResponseGate
+            nonisolated(unsafe) var gated = gateFirstResponse
+            server.flagsResponseHandler = { request in
+                if gated {
+                    gated = false
+                    gate.wait()
+                }
+                var personProperties: [String: Any]?
+                if let data = request.body(),
+                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+                {
+                    personProperties = json["person_properties"] as? [String: Any]
+                }
+                let carriedOverride = personProperties?["app_version_semver"] as? String == "3.09.0"
+
+                let body: [String: Any] = [
+                    "featureFlags": ["override-flag": carriedOverride],
+                    "featureFlagPayloads": [String: Any](),
+                    "errorsWhileComputingFlags": false,
+                ]
+                return HTTPStubsResponse(jsonObject: body, statusCode: 200, headers: nil)
+            }
+        }
+
+        @Test("a reload displaced from the pending slot resolves against a request that went out")
+        func displacedReloadResolvesAgainstRealResponse() async {
+            let sut = getSut()
+            stubFlagsRequiringOverride(delay: 0, gateFirstResponse: true)
+
+            sut.loadFeatureFlags(distinctId: "distinctId", anonymousId: nil, groups: [:], callback: { _ in })
+            sut.setPersonPropertiesForFlags(["app_version_semver": "3.09.0"])
+
+            let flags = await withCheckedContinuation { (continuation: CheckedContinuation<[String: Any]?, Never>) in
+                sut.loadFeatureFlags(distinctId: "distinctId", anonymousId: nil, groups: [:], callback: { flags in
+                    continuation.resume(returning: flags)
+                })
+
+                // displaces the reload above out of the pending slot
+                sut.loadFeatureFlags(distinctId: "distinctId", anonymousId: nil, groups: [:], callback: { _ in })
+                firstResponseGate.signal()
+            }
+
+            #expect(flags?["override-flag"] as? Bool == true)
+            let sent = server.flagsRequests.compactMap { server.parseRequest($0, gzip: false) }
+            #expect(sent.count == 2, "the two displaced reloads should coalesce into one request")
+            let lastOverride = (sent.last?["person_properties"] as? [String: Any])?["app_version_semver"] as? String
+            #expect(lastOverride == "3.09.0", "the coalesced request must carry the override")
+        }
+
+        @Test("setup -> set properties -> identify -> reload reads flags evaluated with the overrides")
+        func startupSequenceReadsFlagsWithOverrides() async {
+            let config = PostHogConfig(projectToken: "test_project_token", host: "http://localhost:9001")
+            config.preloadFeatureFlags = true
+            config.disableReachabilityForTesting = true
+            config.disableQueueTimerForTesting = true
+            config.disableFlushOnBackgroundForTesting = true
+            config.captureApplicationLifecycleEvents = false
+            config.captureScreenViews = false
+            config.sendFeatureFlagEvent = false
+
+            // /config resolves while the first /flags request is still in flight, so the automatic
+            // preload it kicks off competes with the app's own reloads.
+            stubFlagsRequiringOverride(delay: 0.3)
+            server.configResponseDelay = 0.15
+
+            let sut = track(PostHogSDK.with(config))
+
+            await withCheckedContinuation { continuation in
+                sut.setPersonPropertiesForFlags(["app_version_semver": "3.09.0"])
+                sut.identify("test_user")
+                sut.reloadFeatureFlags {
+                    continuation.resume()
+                }
+            }
+
+            #expect(sut.getFeatureFlag("override-flag") as? Bool == true)
+        }
+
+        @Test("setting properties then reloading resolves after a response carrying them")
+        func setPropertiesThenReloadResolvesWithProperties() async {
+            let sut = track(PostHogSDK.with(makeIsolatedConfig()))
+            stubFlagsRequiringOverride(delay: 0)
+
+            await withCheckedContinuation { continuation in
+                sut.setPersonPropertiesForFlags(["app_version_semver": "3.09.0"], reloadFeatureFlags: false)
+                sut.reloadFeatureFlags { continuation.resume() }
+            }
+
+            #expect(sut.getFeatureFlag("override-flag") as? Bool == true)
+        }
+
+        @Test("a queued reload carries person properties set while it waits")
+        func queuedReloadCarriesLatePersonProperties() async {
+            let sut = track(PostHogSDK.with(makeIsolatedConfig()))
+            stubFlagsRequiringOverride(delay: 0.2)
+
+            await withCheckedContinuation { continuation in
+                sut.reloadFeatureFlags()
+                sut.reloadFeatureFlags { continuation.resume() }
+                sut.setPersonPropertiesForFlags(["app_version_semver": "3.09.0"], reloadFeatureFlags: false)
+            }
+
+            #expect(sut.getFeatureFlag("override-flag") as? Bool == true)
+            let lastOverride = server.flagsRequests.last
+                .flatMap { server.parseRequest($0, gzip: false) }
+                .flatMap { $0["person_properties"] as? [String: Any] }?["app_version_semver"] as? String
+            #expect(lastOverride == "3.09.0", "the queued reload must send properties set while it waited")
+        }
+
+        @Test("a failed reload resolves the completion and keeps the cached flags")
+        func completionResolvesOnFailedReload() async {
+            let sut = track(PostHogSDK.with(makeIsolatedConfig()))
+            stubFlagsRequiringOverride(delay: 0)
+            await withCheckedContinuation { continuation in
+                sut.setPersonPropertiesForFlags(["app_version_semver": "3.09.0"], reloadFeatureFlags: false)
+                sut.reloadFeatureFlags { continuation.resume() }
+            }
+            #expect(sut.getFeatureFlag("override-flag") as? Bool == true)
+
+            server.flagsResponseHandler = { _ in
+                HTTPStubsResponse(jsonObject: ["error": "nope"], statusCode: 400, headers: nil)
+            }
+            await withCheckedContinuation { continuation in
+                sut.reloadFeatureFlags { continuation.resume() }
+            }
+
+            #expect(sut.getFeatureFlag("override-flag") as? Bool == true, "a failed reload must not clear cached flags")
+        }
+
+        private func makeIsolatedConfig() -> PostHogConfig {
+            let config = PostHogConfig(projectToken: "test_project_token", host: "http://localhost:9001")
+            config.preloadFeatureFlags = false
+            config.disableReachabilityForTesting = true
+            config.disableQueueTimerForTesting = true
+            config.disableFlushOnBackgroundForTesting = true
+            config.disableRemoteConfigForTesting = true
+            config.captureApplicationLifecycleEvents = false
+            config.captureScreenViews = false
+            config.sendFeatureFlagEvent = false
+            return config
         }
     }
 }

@@ -9,6 +9,12 @@
 #if os(iOS)
 
     import Foundation
+    #if compiler(>=6.0)
+        internal import PostHogObjCExceptionSupport
+    #else
+        // swiftlint:disable:next duplicate_imports
+        @_implementationOnly import PostHogObjCExceptionSupport
+    #endif
 
     final class URLSessionInstrumentation {
         typealias RequestModifier = (URLRequest) -> URLRequest
@@ -118,22 +124,27 @@
         }
 
         private func notifyTaskCreated(task: URLSessionTask, session: URLSession?) {
-            let handlers = lock.withLock {
-                registrations.values.compactMap(\.taskCreated)
-            }
-
-            for handler in handlers {
+            notifyHandlers(\.taskCreated) { handler in
                 handler(task, session)
             }
         }
 
         private func notifyTaskCompleted(task: URLSessionTask, error: Error?) {
+            notifyHandlers(\.taskCompleted) { handler in
+                handler(task, error)
+            }
+        }
+
+        private func notifyHandlers<Handler>(
+            _ keyPath: KeyPath<Registration, Handler?>,
+            invoke: (Handler) -> Void
+        ) {
             let handlers = lock.withLock {
-                registrations.values.compactMap(\.taskCompleted)
+                registrations.values.compactMap { $0[keyPath: keyPath] }
             }
 
             for handler in handlers {
-                handler(task, error)
+                invoke(handler)
             }
         }
     }
@@ -301,13 +312,23 @@
                 }
             }
 
-            private func modifyTaskRequests(_ task: URLSessionTask) {
+            // Internal, used for testing
+            func modifyTaskRequests(_ task: URLSessionTask) {
                 // Only rewrite `currentRequest` for the async/await fallback path.
                 // This is the request closest to what will go over the wire and avoids
-                // mutating `originalRequest` unnecessarily. Use KVC instead of invoking
-                // a private setter selector directly.
-                if let currentRequest = task.currentRequest {
-                    task.setValue(modifyRequest(currentRequest) as NSURLRequest, forKey: Self.currentRequestKey)
+                // mutating `originalRequest` unnecessarily. Some task subclasses throw
+                // on request access or mutation, so this path has to stay best-effort.
+                guard let currentRequest = PHURLSessionTaskSafeAccess.currentRequest(from: task) as URLRequest? else {
+                    hedgeLog("[Session Replay] Skipping request header injection for task \(NSStringFromClass(type(of: task))) because currentRequest is unavailable")
+                    return
+                }
+
+                if !PHURLSessionTaskSafeAccess.setCurrentRequest(
+                    modifyRequest(currentRequest),
+                    on: task,
+                    key: Self.currentRequestKey
+                ) {
+                    hedgeLog("[Session Replay] Failed to inject tracing headers into currentRequest for task \(NSStringFromClass(type(of: task)))")
                 }
             }
         }

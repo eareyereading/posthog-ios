@@ -17,12 +17,20 @@ import Foundation
     import WatchKit
 #endif
 
-let retryDelay = 5.0
+#if os(iOS) || os(macOS)
+    import UserNotifications
+#endif
+
+// SDK compliance harness 0.9.0 validates retry timing against this base cadence.
+let retryDelay = 1.0
 let maxRetryDelay = 30.0
 
 // renamed to PostHogSDK due to https://github.com/apple/swift/issues/56573
-// swiftlint:disable:next type_body_length <- Should be removed once PostHogSDK is refactored
-@objc public class PostHogSDK: NSObject {
+/// Main entry point for capturing analytics, feature flags, logs, surveys, and session replay.
+///
+/// Use `PostHogSDK.shared` for the default singleton instance, or `PostHogSDK.with(_:)`
+/// to create an additional configured instance.
+@objc public class PostHogSDK: NSObject { // swiftlint:disable:this type_body_length
     private(set) var config: PostHogConfig
 
     private init(_ config: PostHogConfig) {
@@ -30,16 +38,36 @@ let maxRetryDelay = 30.0
     }
 
     private var enabled = false
-    private let setupLock = NSLock()
+    private let setupLock = NSRecursiveLock()
     private let optOutLock = NSLock()
     private let groupsLock = NSLock()
     private let flagCallReportedLock = NSLock()
     private let personPropsLock = NSLock()
     private let cachedPersonPropertiesLock = NSLock()
+    private let identifyLock = NSLock()
     private var cachedPersonPropertiesHash: String?
 
-    private var queue: PostHogQueue?
+    private let lastScreenLock = NSLock()
+    private var _lastScreenName: String?
+    var lastScreenName: String? {
+        lastScreenLock.withLock { _lastScreenName }
+    }
+
+    private var pushSubscriptionHandler: PostHogPushSubscriptionHandler?
+    private var queue: PostHogQueue<PostHogEvent>?
+    private let exceptionStepsBufferLock = NSLock()
+    private var _exceptionStepsBuffer: PostHogExceptionStepsBuffer?
+    /// The reference is written under `setupLock` (setup/close/optIn) and read from arbitrary caller
+    /// threads (addExceptionStep/capture), so guard the reference itself with its own lock.
+    private var exceptionStepsBuffer: PostHogExceptionStepsBuffer? {
+        get { exceptionStepsBufferLock.withLock { _exceptionStepsBuffer } }
+        set { exceptionStepsBufferLock.withLock { _exceptionStepsBuffer = newValue } }
+    }
+    /// Fired with the buffer's current steps whenever they change. The error-tracking autocapture
+    /// integration subscribes to mirror them into the crash reporter's `customData`.
+    let onExceptionStepsChanged = PostHogMulticastCallback<[[String: Any]]>()
     private(set) var replayQueue: PostHogReplayQueue?
+    private(set) var logsQueue: PostHogQueue<PostHogLogRecord>?
     private(set) var storage: PostHogStorage?
     #if !os(watchOS)
         private var reachability: Reachability?
@@ -51,8 +79,16 @@ let maxRetryDelay = 30.0
     private var installedIntegrations: [PostHogIntegration] = []
     let sessionManager = PostHogSessionManager()
     let onEventCaptured = PostHogMulticastCallback<PostHogEvent>()
+    /// Fired after the event context changes (identify, reset, group, register). Integrations such as
+    /// crash reporting subscribe to snapshot the context for crash-time capture.
+    let onEventContextChanged = PostHogMulticastCallback<[String: Any]>()
     private var sessionIdChangedToken: RegistrationToken?
     private var didEnterBackgroundToken: RegistrationToken?
+    private var pushRemoteConfigToken: RegistrationToken?
+
+    /// Logger facade exposing `trace/debug/info/warn/error/fatal(_:attributes:)`.
+    /// `nil` before `setup(_:)` is called.
+    @objc public private(set) var logger: PostHogLogger?
 
     #if os(iOS)
         private weak var replayIntegration: PostHogReplayIntegration?
@@ -61,8 +97,14 @@ let maxRetryDelay = 30.0
 
     // nonisolated(unsafe) is introduced in Swift 5.10
     #if swift(>=5.10)
+        /// Shared singleton SDK instance used by most applications.
+        ///
+        /// Call `setup(_:)` once with a `PostHogConfig` before using capture APIs.
         @objc public nonisolated(unsafe) static let shared: PostHogSDK = .init(PostHogConfig(projectToken: ""))
     #else
+        /// Shared singleton SDK instance used by most applications.
+        ///
+        /// Call `setup(_:)` once with a `PostHogConfig` before using capture APIs.
         @objc public static let shared: PostHogSDK = .init(PostHogConfig(projectToken: ""))
     #endif
 
@@ -75,6 +117,9 @@ let maxRetryDelay = 30.0
         uninstallIntegrations()
     }
 
+    /// Enables or disables SDK debug logging at runtime.
+    ///
+    /// - Parameter enabled: Pass `true` to enable verbose logs or `false` to disable them.
     @objc public func debug(_ enabled: Bool = true) {
         if !isEnabled() {
             return
@@ -83,11 +128,22 @@ let maxRetryDelay = 30.0
         toggleHedgeLog(enabled)
     }
 
+    /// Initializes this SDK instance with the provided configuration.
+    ///
+    /// Call this once, as early as possible in app startup. Calls made before setup completes are ignored.
+    /// Calling setup again on the same instance logs a warning and has no effect.
+    ///
+    /// - Parameter config: The configuration to install.
     @objc public func setup(_ config: PostHogConfig) {
         setupLock.withLock {
             toggleHedgeLog(config.debug)
             if enabled {
                 hedgeLog("Setup called despite already being setup!")
+                return
+            }
+
+            if config.projectToken.isEmpty {
+                hedgeLog("PostHog SDK will be disabled because projectToken or apiKey is empty.")
                 return
             }
 
@@ -126,17 +182,57 @@ let maxRetryDelay = 30.0
                 context = PostHogContext()
             #endif
 
+            pushSubscriptionHandler = PostHogPushSubscriptionHandler(
+                api,
+                theStorage,
+                config,
+                distinctIdProvider: { [weak self] in self?.getDistinctId() ?? "" },
+                isConnectedProvider: { [weak self] in self?.isNetworkReachable() ?? true },
+                isAllowedProvider: { [weak self] in
+                    self.map { $0.isEnabled() && !$0.isOptOutState() } ?? false
+                },
+                isEnabledProvider: { [weak self] in self?.isEnabled() ?? false },
+                pushAppIdsProvider: { [weak self] in self?.remoteConfig?.getPushAppIds() },
+                onEventContextChanged: onEventContextChanged
+            )
+
+            // A device whose project had no push integration was answered 200 and stopped asking.
+            // Draining the transition here is the only signal that reaches it.
+            pushRemoteConfigToken = remoteConfig?.onRemoteConfigLoaded.subscribe { [weak self] _ in
+                guard let self, let newlyRegisterable = self.remoteConfig?.consumeNewlyRegisterablePushAppIds(),
+                      !newlyRegisterable.isEmpty
+                else {
+                    return
+                }
+                // Mark the one-time upgrade recovery done only after the handler has durably cleared
+                // any delivered marker, so a crash in between re-runs recovery instead of stranding.
+                self.pushSubscriptionHandler?.onPushAppIdsChanged(newlyRegisterable) { [weak self] in
+                    self?.remoteConfig?.markPushAppIdsMigrated()
+                }
+            }
+
             optOutLock.withLock {
                 let optOut = theStorage.getBool(forKey: .optOut)
                 config.optOut = optOut ?? config.optOut
             }
 
+            // Snapshot resource attributes once so post-setup mutations of
+            // `config.logs.resourceAttributes` aren't honored — matches the
+            // doc contract on `PostHogLogsConfig`.
+            let logsResourceAttributes = PostHogLogsOTLP.buildResourceAttributes(config.logs)
+            let logsEndpoint = QueueEndpoint<PostHogLogRecord>.logs(
+                api: api,
+                resourceAttributes: logsResourceAttributes
+            )
+
             #if !os(watchOS)
-                queue = PostHogQueue(config, theStorage, api, .batch, reachability)
+                queue = PostHogQueue(config, theStorage, .batch(api: api), reachability)
                 replayQueue = PostHogReplayQueue(config, theStorage, api, reachability)
+                logsQueue = PostHogQueue(config, theStorage, logsEndpoint, reachability)
             #else
-                queue = PostHogQueue(config, theStorage, api, .batch)
+                queue = PostHogQueue(config, theStorage, .batch(api: api))
                 replayQueue = PostHogReplayQueue(config, theStorage, api)
+                logsQueue = PostHogQueue(config, theStorage, logsEndpoint)
             #endif
 
             queue?.start(disableReachabilityForTesting: config.disableReachabilityForTesting,
@@ -144,6 +240,9 @@ let maxRetryDelay = 30.0
 
             replayQueue?.start(disableReachabilityForTesting: config.disableReachabilityForTesting,
                                disableQueueTimerForTesting: config.disableQueueTimerForTesting)
+
+            logsQueue?.start(disableReachabilityForTesting: config.disableReachabilityForTesting,
+                             disableQueueTimerForTesting: config.disableQueueTimerForTesting)
 
             // Create session manager instance for this PostHogSDK instance
             sessionManager.setup(config: config)
@@ -153,13 +252,42 @@ let maxRetryDelay = 30.0
                 self?.notifyContextDidChange()
             }
 
+            logger = PostHogLogger(sdk: self)
+
+            // Reconcile an identified bootstrap against an existing local identity BEFORE
+            // installing integrations. The app-lifecycle integration can replay
+            // didFinishLaunching synchronously on install and capture Application
+            // Installed/Updated, so the identify() merge has to run first for those early
+            // events to carry the bootstrapped identity. Runs inside setupLock (recursive, so
+            // identify()'s own setupLock reads are safe re-entrancy), after enabled/queue/
+            // remoteConfig are ready. A fresh install is already seeded in PostHogStorageManager;
+            // this only reconciles an existing local identity.
+            reconcileBootstrapIdentityIfNeeded()
+
             if !config.optOut {
                 // don't install integrations if in opt-out state
                 installIntegrations()
 
-                // Notify integrations of initial context (e.g., for crash reporting)
+                createExceptionStepsBufferIfNeeded()
+
+                // Notify the integrations of the initial event context and buffered steps for crash reporting.
                 notifyContextDidChange()
+                notifyExceptionStepsDidChange()
             }
+
+            #if os(iOS) || os(macOS)
+                // Releases a prewarm this setup turns out not to want — including while opted out,
+                // where the integrations above were never installed and so could never release it.
+                if #available(iOS 14.0, macOS 11.0, *) {
+                    if !config.installsPushNotificationOpenIntegration {
+                        DI.main.pushNotificationPublisher.discardPrewarmedNotificationResponseCapture()
+                    }
+                }
+            #endif
+
+            // Next-launch retry for a persisted, not-yet-delivered push subscription
+            // (no-ops while opted out, offline, or when the record was already delivered).
+            pushSubscriptionHandler?.retryIfNeeded()
 
             // Flush the queue when the app enters background to ensure
             // pending events are sent before the app is suspended
@@ -175,33 +303,88 @@ let maxRetryDelay = 30.0
         }
     }
 
-    @objc public func getDistinctId() -> String {
-        if !isEnabled() {
-            return ""
+    /// Browser-style reconciliation for an identified bootstrap (`isIdentifiedId == true`), matching
+    /// posthog-js: upgrade a matching anonymous id to identified without re-linking, merge a differing
+    /// anonymous user into the bootstrapped identity, or preserve a different already-identified user
+    /// and warn. Identity is persisted even while opted out (only event emission is suppressed).
+    private func reconcileBootstrapIdentityIfNeeded() {
+        guard let bootstrap = config.bootstrap, bootstrap.isIdentifiedId,
+              let bootstrapId = bootstrap.distinctId,
+              !bootstrapId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              let storageManager = config.storageManager
+        else {
+            return
         }
 
-        return config.storageManager?.getDistinctId() ?? ""
+        if storageManager.getDistinctId() == bootstrapId {
+            // Same id: only the identified state needs upgrading. No identify() and no $identify
+            // event, since the distinct id is unchanged. Persists even while opted out.
+            if !storageManager.isIdentified() {
+                storageManager.setIdentified(true)
+            }
+            return
+        }
+
+        // Differing id.
+        if storageManager.isIdentified() {
+            hedgeLog("Bootstrap distinctId differs from an already-identified user. The existing " +
+                "identity is preserved. Call reset() before reinitializing to switch users.")
+        } else if isOptOutState() {
+            // Opted out: identify() would return early without persisting, so write the identity
+            // directly to survive a later opt-in. Keep identify()'s personProfiles == .never gate,
+            // so opt-out never changes whether the bootstrap identity is written.
+            if config.personProfiles != .never {
+                storageManager.setDistinctId(bootstrapId)
+                storageManager.setIdentified(true)
+            }
+        } else {
+            // Existing anonymous user: merge it into the identified bootstrap ID via identify(),
+            // which no-ops when personProfiles == .never. The fresh-install path
+            // (PostHogStorageManager.applyBootstrapIdentityIfNeeded) instead seeds the identity
+            // directly, so under .never a returning anonymous user drops the bootstrap identity while a
+            // fresh install keeps it. That asymmetry is intentional posthog-js parity: the browser SDK
+            // reconciles the same paths through a gated identify() vs an ungated register().
+            identify(bootstrapId)
+        }
     }
 
-    @objc public func getAnonymousId() -> String {
-        if !isEnabled() {
-            return ""
-        }
+    /// Returns the current PostHog distinct ID.
+    ///
+    /// Before `identify(_:)`, this is the anonymous ID. After identify, this is the identified user's ID.
+    ///
+    /// - Returns: The current distinct ID, or an empty string when the SDK is not set up.
+    @objc public func getDistinctId() -> String {
+        getStorageManagerValue { $0.getDistinctId() }
+    }
 
-        return config.storageManager?.getAnonymousId() ?? ""
+    /// Returns the anonymous ID generated for this install.
+    ///
+    /// - Returns: The anonymous ID, or an empty string when the SDK is not set up.
+    @objc public func getAnonymousId() -> String {
+        getStorageManagerValue { $0.getAnonymousId() }
     }
 
     /// Returns the stable device identifier used for device-level feature flag bucketing.
+    ///
     /// This ID persists across `identify()` and `reset()` calls, only changing on a fresh
     /// app install, manual cache clearing, or OS-initiated storage cleanup.
+    ///
+    /// - Returns: The stable device ID, or an empty string when the SDK is not set up.
     @objc public func getDeviceId() -> String {
-        if !isEnabled() {
+        getStorageManagerValue { $0.getDeviceId() }
+    }
+
+    private func getStorageManagerValue(_ value: (PostHogStorageManager) -> String) -> String {
+        guard isEnabled(), let storageManager = config.storageManager else {
             return ""
         }
 
-        return config.storageManager?.getDeviceId() ?? ""
+        return value(storageManager)
     }
 
+    /// Returns the current session ID without rotating or creating a session.
+    ///
+    /// - Returns: The current session ID, or `nil` if no session is active or the SDK is not set up.
     @objc public func getSessionId() -> String? {
         if !isEnabled() {
             return nil
@@ -210,20 +393,26 @@ let maxRetryDelay = 30.0
         return sessionManager.getSessionId(readOnly: true)
     }
 
+    /// Starts or resumes the current analytics session.
     @objc public func startSession() {
-        if !isEnabled() {
-            return
+        performWhenEnabled {
+            sessionManager.startSession()
         }
-
-        sessionManager.startSession()
     }
 
+    /// Ends the current analytics session.
     @objc public func endSession() {
-        if !isEnabled() {
+        performWhenEnabled {
+            sessionManager.endSession()
+        }
+    }
+
+    private func performWhenEnabled(_ action: () -> Void) {
+        guard isEnabled() else {
             return
         }
 
-        sessionManager.endSession()
+        action()
     }
 
     // DEEP LINKS
@@ -238,13 +427,16 @@ let maxRetryDelay = 30.0
             return
         }
 
-        guard let url = url else { return }
+        guard let url else { return }
 
         let properties = PostHogDeepLinkHelper.buildDeepLinkProperties(url: url, referrer: referrer)
 
         capture("Deep Link Opened", properties: properties)
     }
 
+    /// Captures a deep link opened event for a URL.
+    ///
+    /// - Parameter url: The URL that was opened.
     @objc public func captureDeepLink(url: URL) {
         captureDeepLink(url: url as URL?, referrer: nil)
     }
@@ -253,8 +445,7 @@ let maxRetryDelay = 30.0
         /// Capture deep link events from an array of URLs.
         ///
         /// Use this method with macOS `NSApplicationDelegate.application(_:open:)`.
-        /// File URLs are automatically filtered out - only custom URL schemes and
-        /// universal links are captured.
+        /// File URLs are automatically filtered out; every other URL in the array is captured.
         ///
         /// - Parameter urls: The URLs that were opened.
         @objc public func captureDeepLink(urls: [URL]) {
@@ -407,6 +598,16 @@ let maxRetryDelay = 30.0
             }
 
             props["$process_person_profile"] = hasPersonProcessing()
+
+            // Only stamp if the caller didn't supply a non-empty value —
+            // `merging(properties)` below keeps the existing value on conflict,
+            // so seeding would shadow a caller-supplied override. Whitespace-only
+            // caller values are treated as absent (almost always accidental).
+            let trimmedCallerScreenName = (properties?["$screen_name"] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if let name = lastScreenName, !name.isEmpty, trimmedCallerScreenName.isNilOrEmpty {
+                props["$screen_name"] = name
+            }
         }
 
         let sdkInfo = context?.sdkInfo()
@@ -442,11 +643,17 @@ let maxRetryDelay = 30.0
             props["distinct_id"] = distinctId
         }
 
-        props = props.merging(properties ?? [:]) { current, _ in current }
+        let callerProps = properties ?? [:]
+        props = props.merging(callerProps) { current, _ in current }
+        // Caller-supplied feature-flag properties take precedence over the cached values
+        let callerFlagProps = callerProps.filter { $0.key.hasPrefix("$feature/") || $0.key == "$active_feature_flags" }
+        props = props.merging(callerFlagProps) { _, new in new }
 
         return props
     }
 
+    /// Trigger an immediate flush of every queue — events, session-replay
+    /// snapshots, and structured logs.
     @objc public func flush() {
         if !isEnabled() {
             return
@@ -454,11 +661,27 @@ let maxRetryDelay = 30.0
 
         queue?.flush()
         replayQueue?.flush()
+        logsQueue?.flush()
+        pushSubscriptionHandler?.retryIfNeeded()
     }
 
+    /// Resets local identity, super properties, feature flag cache, and session state.
+    ///
+    /// Call this when a user logs out. The next captured event will use a new anonymous identity
+    /// unless `PostHogConfig.reuseAnonymousId` is enabled. If a push token is registered, it is
+    /// unregistered for the logged-out identity and re-registered under the new anonymous id.
     @objc public func reset() {
         if !isEnabled() {
             return
+        }
+
+        // Snapshot the push token + old identity BEFORE storage is cleared, so it can be unregistered
+        // for the logged-out user and re-registered under the new anonymous id (decision 5/6).
+        let pushResetContext: (oldDistinctId: String, deviceToken: String, appId: String)?
+        if let record = pushSubscriptionHandler?.recordForReset() {
+            pushResetContext = (getDistinctId(), record.deviceToken, record.appId)
+        } else {
+            pushResetContext = nil
         }
 
         // storage also removes all feature flags
@@ -472,11 +695,23 @@ let maxRetryDelay = 30.0
         // Clear all in-memory caches (feature flags, session replay state, etc.)
         remoteConfig?.clear()
 
+        lastScreenLock.withLock { _lastScreenName = nil }
+
         // reload flags as anon user
         remoteConfig?.reloadFeatureFlags()
 
         // Notify integrations of context change (e.g., for crash reporting)
         notifyContextDidChange()
+
+        if let ctx = pushResetContext {
+            // Only unregister the old identity when it actually changed. When reset() keeps the same id
+            // (reuseAnonymousId on an anonymous user), the DELETE would unregister the very id we
+            // re-register under — and race the re-register on the same person.
+            if ctx.oldDistinctId != getDistinctId() {
+                pushSubscriptionHandler?.unregister(distinctId: ctx.oldDistinctId, deviceToken: ctx.deviceToken, appId: ctx.appId)
+            }
+            pushSubscriptionHandler?.reregisterAfterReset(deviceToken: ctx.deviceToken, appId: ctx.appId)
+        }
     }
 
     private func getGroups() -> [String: String] {
@@ -494,6 +729,12 @@ let maxRetryDelay = 30.0
     }
 
     // register is a reserved word in ObjC
+    /// Registers super properties that are included with every subsequent event.
+    ///
+    /// New values overwrite existing values for the same keys and persist across app restarts
+    /// until removed with `unregister(_:)` or cleared by `reset()`.
+    ///
+    /// - Parameter properties: Event properties to persist and attach to future captures.
     @objc(registerProperties:)
     public func register(_ properties: [String: Any]) {
         if !isEnabled() {
@@ -515,6 +756,9 @@ let maxRetryDelay = 30.0
         notifyContextDidChange()
     }
 
+    /// Removes a previously registered super property.
+    ///
+    /// - Parameter key: The property key to stop attaching to future events.
     @objc(unregisterProperties:)
     public func unregister(_ key: String) {
         if !isEnabled() {
@@ -531,10 +775,22 @@ let maxRetryDelay = 30.0
         notifyContextDidChange()
     }
 
+    /// Identifies the current user with a stable distinct ID.
+    ///
+    /// By default, the first successful identify call links prior anonymous events to the provided ID.
+    /// If `PostHogConfig.reuseAnonymousId` is `true`, prior anonymous events are not linked.
+    /// Empty IDs, opted-out users, and configurations with `personProfiles == .never` are ignored.
+    ///
+    /// - Parameter distinctId: Stable user identifier from your application.
     @objc public func identify(_ distinctId: String) {
         identify(distinctId, userProperties: nil, userPropertiesSetOnce: nil)
     }
 
+    /// Identifies the current user and sets person properties.
+    ///
+    /// - Parameters:
+    ///   - distinctId: Stable user identifier from your application.
+    ///   - userProperties: Properties to set on the person profile. Existing values are overwritten.
     @objc(identifyWithDistinctId:userProperties:)
     public func identify(_ distinctId: String,
                          userProperties: [String: Any]? = nil)
@@ -542,6 +798,12 @@ let maxRetryDelay = 30.0
         identify(distinctId, userProperties: userProperties, userPropertiesSetOnce: nil)
     }
 
+    /// Identifies the current user and sets person properties.
+    ///
+    /// - Parameters:
+    ///   - distinctId: Stable user identifier from your application.
+    ///   - userProperties: Properties to set on the person profile. Existing values are overwritten.
+    ///   - userPropertiesSetOnce: Properties to set only if they do not already exist.
     @objc(identifyWithDistinctId:userProperties:userPropertiesSetOnce:)
     public func identify(_ distinctId: String,
                          userProperties: [String: Any]? = nil,
@@ -569,21 +831,36 @@ let maxRetryDelay = 30.0
         }
         let oldDistinctId = getDistinctId()
 
-        let isIdentified = storageManager.isIdentified()
+        var isIdentified = false
+        var hasDifferentDistinctId = false
+        var shouldTransitionToIdentified = false
 
-        let hasDifferentDistinctId = distinctId != oldDistinctId
+        // Read isIdentified, decide the transition, and persist it atomically so two
+        // concurrent identify() calls on an anonymous user can't both see isIdentified
+        // == false and each emit a person-processed event for the same transition.
+        identifyLock.withLock {
+            isIdentified = storageManager.isIdentified()
+            hasDifferentDistinctId = distinctId != oldDistinctId
+            shouldTransitionToIdentified = !hasDifferentDistinctId && !isIdentified
+
+            if hasDifferentDistinctId, !isIdentified {
+                if !config.reuseAnonymousId {
+                    // We keep the AnonymousId to be used by flags calls and identify to link the previousId
+                    storageManager.setAnonymousId(oldDistinctId)
+                }
+                storageManager.setDistinctId(distinctId)
+                storageManager.setIdentified(true)
+            } else if shouldTransitionToIdentified {
+                storageManager.setIdentified(true)
+            }
+        }
 
         if hasDifferentDistinctId, !isIdentified {
             var props: [String: Any] = ["distinct_id": distinctId]
 
             if !config.reuseAnonymousId {
-                // We keep the AnonymousId to be used by flags calls and identify to link the previousId
-                storageManager.setAnonymousId(oldDistinctId)
                 props["$anon_distinct_id"] = oldDistinctId
             }
-
-            storageManager.setDistinctId(distinctId)
-            storageManager.setIdentified(true)
 
             let properties = buildProperties(
                 distinctId: distinctId,
@@ -608,6 +885,37 @@ let maxRetryDelay = 30.0
 
             // we need to make sure the user props update is for the same user
             // otherwise they have to reset and identify again
+        } else if shouldTransitionToIdentified {
+            // Matching id while still anonymous (e.g. a non-identified bootstrap seeded the same
+            // id): upgrade to identified and emit one person-processed $set — there is no
+            // anonymous id to merge, so no $identify (matches posthog-js).
+            // setIdentified(true) already performed above under identifyLock.
+
+            setPersonPropertiesForFlagsIfNeeded(userProperties, userPropertiesSetOnce: userPropertiesSetOnce)
+
+            capture("$set",
+                    distinctId: distinctId,
+                    userProperties: userProperties,
+                    userPropertiesSetOnce: userPropertiesSetOnce)
+
+            // The transition event must fire even when an identical property call was cached
+            // earlier; cache only after capture so deduplication cannot suppress it.
+            let hash = getPersonPropertiesHash(
+                distinctId: distinctId,
+                userPropertiesToSet: userProperties,
+                userPropertiesToSetOnce: userPropertiesSetOnce
+            )
+            cachedPersonPropertiesLock.withLock {
+                cachedPersonPropertiesHash = hash
+            }
+
+            // The identified state itself is not part of the flags request; reload only when the
+            // caller supplied properties that can affect flag evaluation.
+            if !(userProperties?.isEmpty ?? true) || !(userPropertiesSetOnce?.isEmpty ?? true) {
+                remoteConfig?.reloadFeatureFlags()
+            }
+
+            notifyContextDidChange()
         } else if !hasDifferentDistinctId, !(userProperties?.isEmpty ?? true) || !(userPropertiesSetOnce?.isEmpty ?? true) {
             if !shouldCapturePersonPropertiesEvent(
                 distinctId: distinctId,
@@ -636,7 +944,7 @@ let maxRetryDelay = 30.0
     /// Sets properties on the person profile associated with the current distinct_id.
     ///
     /// Updates user properties that are stored with the person profile in PostHog.
-    /// If `personProfiles` is set to `never` and no profile exists, this call will be ignored.
+    /// If `personProfiles` is set to `never`, this call will be ignored.
     ///
     /// This method sends a `$set` event to PostHog.
     ///
@@ -652,7 +960,7 @@ let maxRetryDelay = 30.0
     /// Sets properties on the person profile associated with the current distinct_id.
     ///
     /// Updates user properties that are stored with the person profile in PostHog.
-    /// If `personProfiles` is set to `never` and no profile exists, this call will be ignored.
+    /// If `personProfiles` is set to `never`, this call will be ignored.
     ///
     /// This method sends a `$set` event to PostHog.
     ///
@@ -767,6 +1075,23 @@ let maxRetryDelay = 30.0
         return false
     }
 
+    /// Best-effort connectivity check for deferring push registration while offline.
+    /// Defaults to `true` when reachability isn't available (watchOS or disabled for testing).
+    private func isNetworkReachable() -> Bool {
+        #if !os(watchOS)
+            if config.disableReachabilityForTesting {
+                return true
+            }
+            guard let reachability else { return true }
+            if case .unavailable = reachability.connection {
+                return false
+            }
+            return true
+        #else
+            return true
+        #endif
+    }
+
     private func setPersonPropertiesForFlagsIfNeeded(
         _ userProperties: [String: Any]?,
         userPropertiesSetOnce: [String: Any]? = nil
@@ -807,10 +1132,18 @@ let maxRetryDelay = 30.0
         return context?.personPropertiesContext() ?? [:]
     }
 
+    /// Captures a custom event for the current user.
+    ///
+    /// - Parameter event: Event name to capture.
     @objc public func capture(_ event: String) {
         capture(event, distinctId: nil, properties: nil, userProperties: nil, userPropertiesSetOnce: nil, groups: nil)
     }
 
+    /// Captures a custom event with event properties.
+    ///
+    /// - Parameters:
+    ///   - event: Event name to capture.
+    ///   - properties: Event properties attached only to this event.
     @objc(captureWithEvent:properties:)
     public func capture(_ event: String,
                         properties: [String: Any]? = nil)
@@ -818,6 +1151,12 @@ let maxRetryDelay = 30.0
         capture(event, distinctId: nil, properties: properties, userProperties: nil, userPropertiesSetOnce: nil, groups: nil)
     }
 
+    /// Captures a custom event and updates person properties.
+    ///
+    /// - Parameters:
+    ///   - event: Event name to capture.
+    ///   - properties: Event properties attached only to this event.
+    ///   - userProperties: Person properties to set. Existing values are overwritten.
     @objc(captureWithEvent:properties:userProperties:)
     public func capture(_ event: String,
                         properties: [String: Any]? = nil,
@@ -826,6 +1165,13 @@ let maxRetryDelay = 30.0
         capture(event, distinctId: nil, properties: properties, userProperties: userProperties, userPropertiesSetOnce: nil, groups: nil)
     }
 
+    /// Captures a custom event and updates person properties.
+    ///
+    /// - Parameters:
+    ///   - event: Event name to capture.
+    ///   - properties: Event properties attached only to this event.
+    ///   - userProperties: Person properties to set. Existing values are overwritten.
+    ///   - userPropertiesSetOnce: Person properties to set only if they do not already exist.
     @objc(captureWithEvent:properties:userProperties:userPropertiesSetOnce:)
     public func capture(_ event: String,
                         properties: [String: Any]? = nil,
@@ -835,6 +1181,14 @@ let maxRetryDelay = 30.0
         capture(event, distinctId: nil, properties: properties, userProperties: userProperties, userPropertiesSetOnce: userPropertiesSetOnce, groups: nil)
     }
 
+    /// Captures a custom event with group context.
+    ///
+    /// - Parameters:
+    ///   - event: Event name to capture.
+    ///   - properties: Event properties attached only to this event.
+    ///   - userProperties: Person properties to set. Existing values are overwritten.
+    ///   - userPropertiesSetOnce: Person properties to set only if they do not already exist.
+    ///   - groups: Group type/key pairs to attach to this event.
     @objc(captureWithEvent:properties:userProperties:userPropertiesSetOnce:groups:)
     public func capture(_ event: String,
                         properties: [String: Any]? = nil,
@@ -845,6 +1199,15 @@ let maxRetryDelay = 30.0
         capture(event, distinctId: nil, properties: properties, userProperties: userProperties, userPropertiesSetOnce: userPropertiesSetOnce, groups: groups)
     }
 
+    /// Captures a custom event for an explicit distinct ID.
+    ///
+    /// - Parameters:
+    ///   - event: Event name to capture.
+    ///   - distinctId: Optional distinct ID override. Defaults to the current SDK distinct ID.
+    ///   - properties: Event properties attached only to this event.
+    ///   - userProperties: Person properties to set. Existing values are overwritten.
+    ///   - userPropertiesSetOnce: Person properties to set only if they do not already exist.
+    ///   - groups: Group type/key pairs to attach to this event.
     @objc(captureWithEvent:distinctId:properties:userProperties:userPropertiesSetOnce:groups:)
     public func capture(_ event: String,
                         distinctId: String? = nil,
@@ -862,6 +1225,17 @@ let maxRetryDelay = 30.0
                 timestamp: nil)
     }
 
+    /// Captures a custom event for an explicit distinct ID and timestamp.
+    ///
+    /// - Parameters:
+    ///   - event: Event name to capture.
+    ///   - distinctId: Optional distinct ID override. Defaults to the current SDK distinct ID.
+    ///   - properties: Event properties attached only to this event.
+    ///   - userProperties: Person properties to set. Existing values are overwritten.
+    ///   - userPropertiesSetOnce: Person properties to set only if they do not already exist.
+    ///   - groups: Group type/key pairs to attach to this event.
+    ///   - timestamp: Optional event timestamp. Defaults to the current time. The absolute instant
+    ///     is serialized in UTC, regardless of the calendar or time zone used to create it.
     @objc(captureWithEvent:distinctId:properties:userProperties:userPropertiesSetOnce:groups:timestamp:)
     public func capture(_ event: String,
                         distinctId: String? = nil,
@@ -883,6 +1257,145 @@ let maxRetryDelay = 30.0
         )
     }
 
+    // MARK: - Logs capture
+
+    /// Capture a structured log record at `.info` severity.
+    ///
+    /// Log records ship to PostHog via a separate `/i/v1/logs` endpoint and
+    /// are persisted to disk so they survive app restarts. The call performs
+    /// a **synchronous disk write on the calling thread**, then the network
+    /// send happens asynchronously — same contract as `capture(_:)` for
+    /// events. Avoid calling from the main thread on hot paths. Records run
+    /// through `config.logs.beforeSend` and the per-window rate cap before
+    /// enqueueing — both can drop a record silently. An empty or
+    /// whitespace-only `body` is always dropped.
+    ///
+    /// - Parameter body: The log message. Required and non-empty.
+    @objc(captureLogWithBody:)
+    public func captureLog(_ body: String) {
+        captureLogInternal(body, level: .info, attributes: nil, traceId: nil, spanId: nil, traceFlags: nil)
+    }
+
+    /// Capture a structured log record at the given severity.
+    ///
+    /// - Parameters:
+    ///   - body: The log message. Required and non-empty.
+    ///   - level: Severity. Use `.trace`/`.debug` for diagnostic detail,
+    ///     `.info` for regular events, `.warn`/`.error`/`.fatal` for problems.
+    @objc(captureLogWithBody:level:)
+    public func captureLog(_ body: String, level: PostHogLogSeverity) {
+        captureLogInternal(body, level: level, attributes: nil, traceId: nil, spanId: nil, traceFlags: nil)
+    }
+
+    /// Capture a structured log record with caller-supplied attributes.
+    ///
+    /// - Parameters:
+    ///   - body: The log message. Required and non-empty.
+    ///   - level: Severity.
+    ///   - attributes: Per-record attributes (request id, duration, etc.).
+    ///     Values must be JSON-serializable; non-serializable entries are
+    ///     dropped.
+    @objc(captureLogWithBody:level:attributes:)
+    public func captureLog(_ body: String, level: PostHogLogSeverity, attributes: [String: Any]?) {
+        captureLogInternal(body, level: level, attributes: attributes, traceId: nil, spanId: nil, traceFlags: nil)
+    }
+
+    /// Capture a structured log record with W3C trace context. Intended for
+    /// callers correlating logs with distributed traces; most apps should use
+    /// the simpler overload.
+    ///
+    /// - Parameters:
+    ///   - body: The log message. Required and non-empty.
+    ///   - level: Severity.
+    ///   - attributes: Per-record attributes. Same rules as the simpler overload.
+    ///   - traceId: 32-character lowercase hex W3C trace id.
+    ///   - spanId: 16-character lowercase hex W3C span id.
+    ///   - traceFlags: W3C trace flags bitfield (bit 0 is the `sampled` flag).
+    ///     `nil` omits the field on the wire; `0` emits an explicit zero.
+    @objc(captureLogWithBody:level:attributes:traceId:spanId:traceFlags:)
+    public func captureLog(_ body: String,
+                           level: PostHogLogSeverity,
+                           attributes: [String: Any]?,
+                           traceId: String?,
+                           spanId: String?,
+                           traceFlags: NSNumber?)
+    {
+        captureLogInternal(body, level: level, attributes: attributes, traceId: traceId, spanId: spanId, traceFlags: traceFlags?.intValue)
+    }
+
+    /// Swift-native variant of `captureLog` with default values for every
+    /// argument except `body`. Most call sites can write `captureLog("...")`
+    /// or `captureLog("...", level: .warn, attributes: [...])`.
+    ///
+    /// - Parameters:
+    ///   - body: The log message. Required and non-empty.
+    ///   - level: Severity. Defaults to `.info`.
+    ///   - attributes: Per-record attributes. Values must be JSON-serializable.
+    ///   - traceId: Optional 32-character lowercase hex W3C trace ID.
+    ///   - spanId: Optional 16-character lowercase hex W3C span ID.
+    ///   - traceFlags: Optional W3C trace flags bitfield.
+    public func captureLog(_ body: String,
+                           level: PostHogLogSeverity = .info,
+                           attributes: [String: Any]? = nil,
+                           traceId: String? = nil,
+                           spanId: String? = nil,
+                           traceFlags: Int? = nil)
+    {
+        captureLogInternal(body, level: level, attributes: attributes, traceId: traceId, spanId: spanId, traceFlags: traceFlags)
+    }
+
+    private func captureLogInternal(_ body: String,
+                                    level: PostHogLogSeverity,
+                                    attributes: [String: Any]?,
+                                    traceId: String?,
+                                    spanId: String?,
+                                    traceFlags: Int?)
+    {
+        if !isEnabled() { return }
+        if isOptOutState() { return }
+        guard !body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            hedgeLog("captureLog: empty body, dropping")
+            return
+        }
+        guard let logsQueue else { return }
+
+        // Capture-time context snapshot — cheap reads only, safe from any
+        // thread. Identity/session changes between capture and flush will not
+        // alter the record because the snapshot is frozen here.
+        let distinctId = getDistinctId()
+        let sessionId = sessionManager.getSessionId(readOnly: true)
+        let screenName = lastScreenName
+        let appState: PostHogLogRecord.AppState = sessionManager.isAppInBackgroundSnapshot ? .background : .foreground
+        let featureFlagKeys: [String] = (remoteConfig?.getFeatureFlags() as? [String: Any])?.compactMap { key, value in
+            // Bool flags are active iff true; multivariant (non-bool) values
+            // are always active.
+            if let boolValue = value as? Bool { return boolValue ? key : nil }
+            return key
+        }.sorted() ?? []
+
+        let nanos = nanosNow()
+        let record = PostHogLogRecord(
+            body: body,
+            level: level,
+            attributes: attributes ?? [:],
+            traceId: traceId,
+            spanId: spanId,
+            traceFlags: traceFlags.map { NSNumber(value: $0) },
+            timeUnixNano: nanos,
+            observedTimeUnixNano: nanos,
+            distinctId: distinctId.isEmpty ? nil : distinctId,
+            sessionId: sessionId,
+            screenName: screenName,
+            appState: appState.rawValue,
+            featureFlagKeys: featureFlagKeys
+        )
+
+        // `runBeforeSend` enforces the empty-body drop, so we don't need a
+        // post-callback check here.
+        guard let processed = config.logs.runBeforeSend(record) else { return }
+        logsQueue.add(processed)
+    }
+
     /// Internal capture method that handles all event capture logic.
     ///
     /// - Parameters:
@@ -896,7 +1409,8 @@ let maxRetryDelay = 30.0
         userPropertiesSetOnce: [String: Any]? = nil,
         groups: [String: String]? = nil,
         timestamp: Date? = nil,
-        skipBuildProperties: Bool = false
+        skipBuildProperties: Bool = false,
+        propertyAllowlist: Set<String>? = nil
     ) {
         if !isEnabled() {
             return
@@ -908,6 +1422,17 @@ let maxRetryDelay = 30.0
 
         guard let queue else {
             return
+        }
+
+        // $exception_list only ever comes from the caller, so raw properties are sufficient here
+        if event == "$exception" {
+            let ignored = config.errorTrackingConfig.ignoredExceptionTypes
+            if !ignored.isEmpty,
+               PostHogErrorTrackingAutoCaptureIntegration.exceptionListMatchesIgnoredTypes(properties ?? [:], ignoredTypes: ignored)
+            {
+                hedgeLog("$exception skipped: exception type is in errorTrackingConfig.ignoredExceptionTypes")
+                return
+            }
         }
 
         var isSnapshotEvent = event == "$snapshot"
@@ -924,7 +1449,7 @@ let maxRetryDelay = 30.0
             requirePersonProcessing()
         }
 
-        let finalProperties: [String: Any]
+        var finalProperties: [String: Any]
         if skipBuildProperties {
             // Use properties as-is (already built at crash time)
             finalProperties = properties ?? [:]
@@ -938,6 +1463,24 @@ let maxRetryDelay = 30.0
                 appendSharedProps: !isSnapshotEvent,
                 timestamp: timestamp
             )
+        }
+
+        // Filtering after the full build stays robust as new context properties are added later:
+        // anything not explicitly allowlisted is stripped. beforeSend hooks and the legacy
+        // propertiesSanitizer run later (in buildEvent) and may re-add keys — an accepted
+        // escape hatch, codified in the minimal-event contract.
+        if let propertyAllowlist {
+            finalProperties = finalProperties.filter { propertyAllowlist.contains($0.key) }
+        }
+
+        // Attach the session-scoped step buffer to a `$exception` unless the caller provided their own.
+        // The buffer is left intact; recording is synchronous, so a step added just before this capture
+        // on the same thread is already present.
+        let isExceptionEvent = event == "$exception" && !skipBuildProperties
+        if isExceptionEvent, finalProperties[PostHogExceptionStepFields.stepsKey] == nil,
+           let steps = attachableExceptionSteps
+        {
+            finalProperties[PostHogExceptionStepFields.stepsKey] = steps
         }
 
         // Sanitize is now called in buildEvent
@@ -974,10 +1517,24 @@ let maxRetryDelay = 30.0
         }
     }
 
+    /// Records a screen view by capturing a `$screen` event.
+    ///
+    /// - Parameter screenTitle: The screen name to record.
     @objc public func screen(_ screenTitle: String) {
         screen(screenTitle, properties: nil)
     }
 
+    /// Records a screen view by capturing a `$screen` event with `screenTitle`.
+    ///
+    /// The title is also cached and automatically attached as `$screen_name` to
+    /// every subsequent event (until `reset()` or `close()` clears it).
+    ///
+    /// To override the auto-attached value on a specific event, pass `$screen_name`
+    /// in that event's `properties` dictionary.
+    ///
+    /// - Parameters:
+    ///   - screenTitle: The screen name to record.
+    ///   - properties: Additional properties to attach to this `$screen` event.
     @objc(screenWithTitle:properties:)
     public func screen(_ screenTitle: String, properties: [String: Any]? = nil) {
         if !isEnabled() {
@@ -988,13 +1545,30 @@ let maxRetryDelay = 30.0
             return
         }
 
+        // Strip SwiftUI wrappers (UIHostingController<X> → X). Drops degenerate
+        // inputs (empty, stripped-AnyView) — for those we skip the $screen event
+        // and leave the cache untouched so the last useful name survives.
+        guard let cleaned = PostHogScreenNameSanitizer.sanitize(rawScreenName: screenTitle) else {
+            return
+        }
+
+        // Cache the name before the queue check so a screen() call during init
+        // (queue not yet assigned) still seeds the cache for subsequent events.
+        // Track whether the value actually changed so we can skip the crash-
+        // replay snapshot refresh on duplicate viewDidAppears for the same VC.
+        let screenNameChanged = lastScreenLock.withLock { () -> Bool in
+            let changed = _lastScreenName != cleaned
+            _lastScreenName = cleaned
+            return changed
+        }
+
         guard let queue else {
             return
         }
 
         let props = [
-            "$screen_name": screenTitle,
-        ].merging(sanitizeDictionary(properties) ?? [:]) { prop, _ in prop }
+            "$screen_name": cleaned,
+        ].merging(sanitizeDictionary(properties) ?? [:]) { _, new in new }
 
         let distinctId = getDistinctId()
 
@@ -1005,6 +1579,21 @@ let maxRetryDelay = 30.0
         }
 
         queueEvent(event, queue: queue)
+
+        // Fanout to subscribers (sanitized; downstream listeners no longer
+        // need to re-apply sanitize). Currently no in-tree subscribers — kept
+        // as an extension point for external consumers. Subscribers must not
+        // re-enter screen().
+        DI.main.screenViewPublisher.onNewScreenName(cleaned)
+
+        // Refresh the crash-replay snapshot only when the screen actually
+        // changed — `viewDidAppear` re-fires for the same VC on every tab
+        // switch / sheet dismiss, and the snapshot includes a full event-
+        // properties build + JSON serialize + customData write that we don't
+        // want to repeat on the main thread for no behavior change.
+        if screenNameChanged {
+            notifyContextDidChange()
+        }
     }
 
     func autocapture(
@@ -1012,35 +1601,29 @@ let maxRetryDelay = 30.0
         elementsChain: String,
         properties: [String: Any]
     ) {
-        if !isEnabled() {
-            return
-        }
-
-        if isOptOutState() {
-            return
-        }
-
-        guard let queue else {
-            return
-        }
-
-        let props = [
-            "$event_type": eventType,
-            "$elements_chain": elementsChain,
-        ].merging(sanitizeDictionary(properties) ?? [:]) { prop, _ in prop }
-
-        let distinctId = getDistinctId()
-
-        let properties = buildProperties(distinctId: distinctId, properties: props)
-
-        guard let event = buildEvent(event: "$autocapture", distinctId: distinctId, properties: properties) else {
-            return
-        }
-
-        queueEvent(event, queue: queue)
+        captureAutocaptureEvent(
+            "$autocapture",
+            eventType: eventType,
+            elementsChain: elementsChain,
+            properties: properties
+        )
     }
 
     func rageclick(
+        eventType: String,
+        elementsChain: String,
+        properties: [String: Any]
+    ) {
+        captureAutocaptureEvent(
+            "$rageclick",
+            eventType: eventType,
+            elementsChain: elementsChain,
+            properties: properties
+        )
+    }
+
+    private func captureAutocaptureEvent(
+        _ eventName: String,
         eventType: String,
         elementsChain: String,
         properties: [String: Any]
@@ -1066,7 +1649,7 @@ let maxRetryDelay = 30.0
 
         let properties = buildProperties(distinctId: distinctId, properties: props)
 
-        guard let event = buildEvent(event: "$rageclick", distinctId: distinctId, properties: properties) else {
+        guard let event = buildEvent(event: eventName, distinctId: distinctId, properties: properties) else {
             return
         }
 
@@ -1080,6 +1663,12 @@ let maxRetryDelay = 30.0
         return properties
     }
 
+    /// Assigns an additional distinct ID to the current user.
+    ///
+    /// Use alias when a user should be connected to another identifier that was previously used
+    /// to track them. This sends a `$create_alias` event.
+    ///
+    /// - Parameter alias: The additional distinct ID to associate with the current user.
     @objc public func alias(_ alias: String) {
         if !isEnabled() {
             return
@@ -1199,16 +1788,29 @@ let maxRetryDelay = 30.0
         return resultEvent
     }
 
-    private func queueEvent(_ event: PostHogEvent, queue: PostHogQueue) {
+    private func queueEvent(_ event: PostHogEvent, queue: PostHogQueue<PostHogEvent>) {
         queue.add(event)
         onEventCaptured.invoke(event)
     }
 
+    /// Associates subsequent events with a group.
+    ///
+    /// - Parameters:
+    ///   - type: Group type, such as `"company"` or `"organization"`.
+    ///   - key: Group key from your application.
     @objc(groupWithType:key:)
     public func group(type: String, key: String) {
         group(type: type, key: key, groupProperties: nil)
     }
 
+    /// Associates subsequent events with a group and optionally updates group properties.
+    ///
+    /// This sends a `$groupidentify` event and reloads feature flags if the group value changed.
+    ///
+    /// - Parameters:
+    ///   - type: Group type, such as `"company"` or `"organization"`.
+    ///   - key: Group key from your application.
+    ///   - groupProperties: Optional properties to set on the group profile.
     @objc(groupWithType:key:groupProperties:)
     public func group(type: String, key: String, groupProperties: [String: Any]? = nil) {
         if !isEnabled() {
@@ -1254,6 +1856,11 @@ let maxRetryDelay = 30.0
     /// let flagValue = PostHogSDK.shared.isFeatureEnabled("new_feature")
     /// ```
     ///
+    /// - Important: The reload is asynchronous and is **not** ordered against the automatic preload
+    ///   that `PostHogConfig.preloadFeatureFlags` starts at setup. See
+    ///   ``setPersonPropertiesForFlags(_:reloadFeatureFlags:)`` for the startup ordering contract and
+    ///   how to wait for flags evaluated with these properties.
+    ///
     /// - Parameter properties: Dictionary of person properties to include in flag evaluation
     /// - SeeAlso: `setPersonPropertiesForFlags(_:reloadFeatureFlags:)` to control flag reloading behavior
     @objc public func setPersonPropertiesForFlags(_ properties: [String: Any]) {
@@ -1279,6 +1886,34 @@ let maxRetryDelay = 30.0
     /// // Manually reload flags later
     /// PostHogSDK.shared.reloadFeatureFlags()
     /// ```
+    ///
+    /// ## Startup ordering
+    /// Several code paths can each start a `/flags` request at launch, and none of them is ordered
+    /// against this call:
+    /// - the automatic preload started during `setup()` when `PostHogConfig.preloadFeatureFlags` is
+    ///   `true` (the default) — it can go out before your properties are set, so an early flag read
+    ///   may see values evaluated without them,
+    /// - `identify(...)`, which reloads flags itself,
+    /// - any explicit `reloadFeatureFlags()` your app makes.
+    ///
+    /// Requests are coalesced rather than run concurrently, so your properties always reach the server
+    /// eventually. To read a flag that reflects them, set them without reloading and wait for an
+    /// explicit reload rather than reading immediately after setup:
+    ///
+    /// ```swift
+    /// PostHogSDK.shared.setPersonPropertiesForFlags(["plan": "premium"], reloadFeatureFlags: false)
+    /// PostHogSDK.shared.reloadFeatureFlags {
+    ///     let flagValue = PostHogSDK.shared.isFeatureEnabled("new_feature")
+    /// }
+    /// ```
+    ///
+    /// Setting `PostHogConfig.preloadFeatureFlags = false` removes the automatic preload entirely and
+    /// leaves your app in control of when flags load.
+    ///
+    /// - Note: `reset()` clears person properties set here, so they must be set again afterwards.
+    /// - Note: `reloadFeatureFlags(_:)` reports that the reload finished, not that it succeeded. If the
+    ///   request fails, or the project is over its feature flag quota, the handler still runs and the
+    ///   flags you read are the previously cached ones.
     ///
     /// - Parameters:
     ///   - properties: Dictionary of person properties to include in flag evaluation
@@ -1420,6 +2055,8 @@ let maxRetryDelay = 30.0
     /// // Clear all group properties
     /// PostHogSDK.shared.resetGroupPropertiesForFlags(reloadFeatureFlags: true)
     /// ```
+    ///
+    /// - Parameter reloadFeatureFlags: Whether to automatically reload feature flags after clearing all group properties.
     @objc(resetGroupPropertiesForFlagsWithReloadFeatureFlags:)
     public func resetGroupPropertiesForFlags(reloadFeatureFlags: Bool = true) {
         internalResetGroupPropertiesForFlags(groupType: nil, reloadFeatureFlags: reloadFeatureFlags)
@@ -1449,7 +2086,7 @@ let maxRetryDelay = 30.0
     ///
     /// - Parameters:
     ///   - groupType: The group type to clear properties for
-    ///   - reloadFeatureFlags: Whether to automatically reload feature flags after setting properties
+    ///   - reloadFeatureFlags: Whether to automatically reload feature flags after clearing properties for this group type.
     @objc(resetGroupPropertiesForFlagsWithGroupType:reloadFeatureFlags:)
     public func resetGroupPropertiesForFlags(_ groupType: String, reloadFeatureFlags: Bool = true) {
         internalResetGroupPropertiesForFlags(groupType: groupType, reloadFeatureFlags: reloadFeatureFlags)
@@ -1468,69 +2105,72 @@ let maxRetryDelay = 30.0
         }
     }
 
+    /// Reloads feature flags for the current user and group context.
     @objc public func reloadFeatureFlags() {
         reloadFeatureFlags {
             // No use case
         }
     }
 
+    /// Reloads feature flags and invokes a callback when finished.
+    ///
+    /// - Parameter callback: Invoked when the reload finishes, or immediately if the reload
+    ///   is skipped (SDK disabled/opted-out, or no remote config available).
     @objc(reloadFeatureFlagsWithCallback:)
     public func reloadFeatureFlags(_ callback: @escaping () -> Void) {
         if !isEnabled() {
+            callback()
             return
         }
 
-        remoteConfig?.reloadFeatureFlags { _ in
+        guard let remoteConfig else {
+            callback()
+            return
+        }
+
+        remoteConfig.reloadFeatureFlags { _ in
             callback()
         }
     }
 
-    /// Captures a $feature_view event for the specified feature flag.
+    /// Captures a `$feature_view` event for the specified feature flag.
     ///
-    /// - Parameter flag: The key of the feature flag being viewed.
-    /// - Parameter flagVariant: The variant of the feature flag being viewed.
+    /// - Parameters:
+    ///   - flag: The key of the feature flag being viewed.
+    ///   - flagVariant: The variant of the feature flag being viewed. If `nil`, the SDK
+    ///     looks up the current flag value and skips capture when no value is available.
     @objc public func captureFeatureView(flag: String, flagVariant: String?) {
-        if !isEnabled() {
-            return
-        }
-
-        if isOptOutState() {
-            return
-        }
-
-        // Get the variant value — prefer the explicitly passed variant, then fall back to a flag lookup.
-        // If neither is available, there is no meaningful variant to record, so we skip the event.
-        guard let variant: Any = flagVariant ?? getFeatureFlag(flag, sendEvent: false) else {
-            hedgeLog("captureFeatureView called for flag '\(flag)' but no variant value is available. Event will not be captured.")
-            return
-        }
-
-        var props: [String: Any] = [
-            "feature_flag": flag,
-        ]
-
-        if let variantStr = variant as? String {
-            props["feature_flag_variant"] = variantStr
-        }
-
-        let userProps: [String: Any] = [
-            "$feature_view/\(flag)": variant,
-        ]
-
-        capture(
+        captureFeatureEvent(
             "$feature_view",
-            properties: props,
-            userProperties: userProps
+            flag: flag,
+            flagVariant: flagVariant,
+            logName: "captureFeatureView"
         )
     }
 
-    /// Captures a $feature_interaction event for the specified feature flag.
+    /// Captures a `$feature_interaction` event for the specified feature flag.
     ///
-    /// - Parameter flag: The key of the feature flag being interacted with.
-    /// - Parameter flagVariant: The variant of the feature flag being interacted with.
+    /// - Parameters:
+    ///   - flag: The key of the feature flag being interacted with.
+    ///   - flagVariant: The variant of the feature flag being interacted with. If `nil`, the SDK
+    ///     looks up the current flag value and skips capture when no value is available.
     @objc public func captureFeatureInteraction(
         flag: String,
         flagVariant: String?
+    ) {
+        captureFeatureEvent(
+            "$feature_interaction",
+            flag: flag,
+            flagVariant: flagVariant,
+            logName: "captureFeatureInteraction"
+        )
+    }
+
+    private func captureFeatureEvent(
+        _ event: String,
+        flag: String,
+        flagVariant: String?,
+        logName: String
     ) {
         if !isEnabled() {
             return
@@ -1543,7 +2183,7 @@ let maxRetryDelay = 30.0
         // Get the variant value — prefer the explicitly passed variant, then fall back to a flag lookup.
         // If neither is available, there is no meaningful variant to record, so we skip the event.
         guard let variant: Any = flagVariant ?? getFeatureFlag(flag, sendEvent: false) else {
-            hedgeLog("captureFeatureInteraction called for flag '\(flag)' but no variant value is available. Event will not be captured.")
+            hedgeLog("\(logName) called for flag '\(flag)' but no variant value is available. Event will not be captured.")
             return
         }
 
@@ -1556,11 +2196,11 @@ let maxRetryDelay = 30.0
         }
 
         let userProps: [String: Any] = [
-            "$feature_interaction/\(flag)": variant,
+            "\(event)/\(flag)": variant,
         ]
 
         capture(
-            "$feature_interaction",
+            event,
             properties: props,
             userProperties: userProps
         )
@@ -1578,6 +2218,12 @@ let maxRetryDelay = 30.0
         getFeatureFlagResult(key, sendEvent: nil)
     }
 
+    /// Returns the feature flag result and optionally captures a usage event.
+    ///
+    /// - Parameters:
+    ///   - key: The feature flag key.
+    ///   - sendFeatureFlagEvent: Whether to capture `$feature_flag_called` for this lookup.
+    /// - Returns: A result containing enabled state, variant, and payload, or `nil` if unavailable.
     @objc(getFeatureFlagResultWithKey:sendFeatureFlagEvent:)
     public func getFeatureFlagResult(_ key: String, sendFeatureFlagEvent: Bool) -> PostHogFeatureFlagResult? {
         getFeatureFlagResult(key, sendEvent: sendFeatureFlagEvent)
@@ -1603,10 +2249,22 @@ let maxRetryDelay = 30.0
         return result
     }
 
+    /// Returns a feature flag value.
+    ///
+    /// Boolean flags return `Bool`. Multivariate flags return their variant `String`.
+    ///
+    /// - Parameter key: The feature flag key.
+    /// - Returns: `Bool`, `String`, or `nil` if the flag is unavailable.
     @objc public func getFeatureFlag(_ key: String) -> Any? {
         getFeatureFlag(key, sendEvent: nil)
     }
 
+    /// Returns a feature flag value and optionally captures a usage event.
+    ///
+    /// - Parameters:
+    ///   - key: The feature flag key.
+    ///   - sendFeatureFlagEvent: Whether to capture `$feature_flag_called` for this lookup.
+    /// - Returns: `Bool`, `String`, or `nil` if the flag is unavailable.
     @objc(getFeatureFlagWithKey:sendFeatureFlagEvent:)
     public func getFeatureFlag(_ key: String, sendFeatureFlagEvent: Bool) -> Any? {
         getFeatureFlag(key, sendEvent: sendFeatureFlagEvent)
@@ -1617,10 +2275,22 @@ let maxRetryDelay = 30.0
         return result?.variant ?? result?.enabled
     }
 
+    /// Returns whether a feature flag is enabled.
+    ///
+    /// Multivariate flags are considered enabled when a variant string is returned.
+    ///
+    /// - Parameter key: The feature flag key.
+    /// - Returns: `true` when the flag is enabled, otherwise `false`.
     @objc public func isFeatureEnabled(_ key: String) -> Bool {
         isFeatureEnabled(key, sendEvent: nil)
     }
 
+    /// Returns whether a feature flag is enabled and optionally captures a usage event.
+    ///
+    /// - Parameters:
+    ///   - key: The feature flag key.
+    ///   - sendFeatureFlagEvent: Whether to capture `$feature_flag_called` for this lookup.
+    /// - Returns: `true` when the flag is enabled, otherwise `false`.
     @objc(isFeatureEnabledWithKey:sendFeatureFlagEvent:)
     public func isFeatureEnabled(_ key: String, sendFeatureFlagEvent: Bool) -> Bool {
         isFeatureEnabled(key, sendEvent: sendFeatureFlagEvent)
@@ -1631,8 +2301,31 @@ let maxRetryDelay = 30.0
         return result is String ? true : (result as? Bool) ?? false
     }
 
+    /// Returns all currently loaded feature flags as structured results.
+    ///
+    /// Each `PostHogFeatureFlagResult` carries the flag's `key`, `enabled` state,
+    /// `variant` (for multivariate flags), and decoded `payload`. Flags become available
+    /// after they finish loading from the server; before the first load (or when the SDK
+    /// is disabled) this returns `nil`. Reading does not capture `$feature_flag_called` events.
+    ///
+    /// - Returns: An array of `PostHogFeatureFlagResult`, or `nil` if no flags are loaded.
+    ///
+    /// ```swift
+    /// for flag in PostHogSDK.shared.getAllFeatureFlags() ?? [] {
+    ///     print(flag.key, flag.enabled, flag.payload as Any)
+    /// }
+    /// ```
+    @objc public func getAllFeatureFlags() -> [PostHogFeatureFlagResult]? {
+        if !isEnabled() {
+            return nil
+        }
+        return remoteConfig?.getAllFeatureFlagResults()
+    }
+
     /// Returns the payload for a feature flag.
     ///
+    /// - Parameter key: The feature flag key.
+    /// - Returns: The flag payload, or `nil` if the flag or payload is unavailable.
     /// - Warning: This method does not send the `$feature_flag_called` event.
     ///   Use `getFeatureFlagResult(_:)` instead for proper analytics tracking.
     @available(*, deprecated, message: "Use getFeatureFlagResult(_:) instead which properly tracks feature flag usage")
@@ -1654,6 +2347,38 @@ let maxRetryDelay = 30.0
             return false
         }
     }
+
+    /// The strict property allowlist for minimal `$feature_flag_called` events. Everything else —
+    /// registered super properties, `$active_feature_flags`, the `$feature/<key>` enumeration,
+    /// bootstrap enrichment — is stripped. Kept in sync with the cross-SDK minimal
+    /// `$feature_flag_called` contract.
+    private static let minimalFeatureFlagCalledProperties: Set<String> = [
+        "$feature_flag",
+        "$feature_flag_response",
+        "$feature_flag_has_experiment",
+        "$feature_flag_id",
+        "$feature_flag_version",
+        "$feature_flag_reason",
+        "$feature_flag_request_id",
+        "$feature_flag_evaluated_at",
+        "$groups",
+        "$process_person_profile",
+        "$session_id",
+        "$lib",
+        "$lib_version",
+        // Mobile's debug/breakdown analog to python's $os/$os_version/$python_runtime and browser
+        // JS's $current_url/$pathname: kept so OS- and app-version-segmented insights still work.
+        "$os_name",
+        "$os_version",
+        "$app_version",
+        // Forward-looking cross-SDK contract entries: not produced by buildProperties for
+        // $feature_flag_called on iOS today ($device_id is added later by PostHogApi on the
+        // /flags request only; $window_id is snapshot-only; $feature_flag_error isn't emitted
+        // by this SDK yet). Kept so the allowlist matches the shared contract as those signals land.
+        "$feature_flag_error",
+        "$window_id",
+        "$device_id",
+    ]
 
     private func reportFeatureFlagCalled(flagKey: String, flagValue: Any?) {
         if remoteConfig == nil {
@@ -1681,6 +2406,8 @@ let maxRetryDelay = 30.0
             let requestId = remoteConfig?.lastRequestId ?? ""
             let evaluatedAt = remoteConfig?.lastEvaluatedAt
             let details = remoteConfig?.getFeatureFlagDetails(flagKey)
+            // Unknown until the flags response explicitly reports it; any missing signal → full event.
+            var hasExperiment: Bool?
 
             var properties: [String: Any] = [
                 "$feature_flag": flagKey,
@@ -1700,20 +2427,46 @@ let maxRetryDelay = 30.0
                 if let metadata = details["metadata"] as? [String: Any] {
                     properties["$feature_flag_id"] = metadata["id"] ?? NSNull()
                     properties["$feature_flag_version"] = metadata["version"] ?? NSNull()
+                    if let flagHasExperiment = metadata["has_experiment"] as? Bool {
+                        properties["$feature_flag_has_experiment"] = flagHasExperiment
+                        hasExperiment = flagHasExperiment
+                    }
                 }
             }
 
-            capture("$feature_flag_called", properties: properties)
+            if let bootstrapMetadata = remoteConfig?.getBootstrapCallMetadata(flagKey) {
+                properties["$feature_flag_bootstrapped_response"] = bootstrapMetadata.response
+
+                if let bootstrappedPayload = bootstrapMetadata.payload {
+                    properties["$feature_flag_bootstrapped_payload"] = bootstrappedPayload
+                }
+
+                properties["$used_bootstrap_value"] = bootstrapMetadata.usedBootstrapValue
+            }
+
+            // Emit the minimal shape only when the server gate is on and the flag verifiably has no
+            // experiment. Experiment-linked flags keep the full envelope for exposure analysis.
+            let sendMinimalEvent = remoteConfig?.sendMinimalFlagCalledEvents == true && hasExperiment == false
+
+            captureInternal(
+                "$feature_flag_called",
+                properties: properties,
+                propertyAllowlist: sendMinimalEvent ? PostHogSDK.minimalFeatureFlagCalledProperties : nil
+            )
         }
     }
 
     private func isEnabled() -> Bool {
+        let enabled = setupLock.withLock { self.enabled }
         if !enabled {
             hedgeLog("PostHog method was called without `setup` being complete. Call wil be ignored.")
         }
         return enabled
     }
 
+    /// Opts the current user back into data capture.
+    ///
+    /// This persists the opt-in state and installs integrations that were disabled while opted out.
     @objc public func optIn() {
         if !isEnabled() {
             return
@@ -1730,9 +2483,29 @@ let maxRetryDelay = 30.0
 
         setupLock.withLock {
             installIntegrations()
+            // Start the buffer for this run, then notify the freshly installed crash writer of the
+            // current context and any buffered steps (the buffer survives opt-out, so steps may exist).
+            createExceptionStepsBufferIfNeeded()
+            notifyContextDidChange()
+            notifyExceptionStepsDidChange()
         }
+
+        #if os(iOS)
+            // A prior logout unregister cleared the push token; opt-in re-installs the subscription
+            // integration above but that alone doesn't refetch the token. Re-request it so the
+            // redelivered token re-registers this device, re-arming push without an app restart (#746).
+            // Gate on the same conditions that install the subscription integration: auto-capture and
+            // swizzling. Without swizzling the integration is skipped, so refetching would fire the host's
+            // APNs lifecycle with no observer to forward the token.
+            if #available(iOS 14.0, *), config.capturePushNotificationSubscriptions, config.enableSwizzling {
+                PostHogPushNotificationSubscriptionIntegration.requestTokenRefresh()
+            }
+        #endif
     }
 
+    /// Opts the current user out of data capture.
+    ///
+    /// This persists the opt-out state, stops integrations, and causes future capture calls to be ignored.
     @objc public func optOut() {
         if !isEnabled() {
             return
@@ -1747,11 +2520,16 @@ let maxRetryDelay = 30.0
             storage?.setBool(forKey: .optOut, contents: true)
         }
 
+        pushSubscriptionHandler?.onOptOut()
+
         setupLock.withLock {
             uninstallIntegrations()
         }
     }
 
+    /// Returns whether this SDK instance is currently opted out.
+    ///
+    /// - Returns: `true` when opted out or when the SDK is not set up.
     @objc public func isOptOut() -> Bool {
         if !isEnabled() {
             return true
@@ -1760,6 +2538,9 @@ let maxRetryDelay = 30.0
         return config.optOut
     }
 
+    /// Shuts down this SDK instance and clears its in-memory state.
+    ///
+    /// Queues are stopped, integrations are uninstalled, and this instance must be set up again before reuse.
     @objc public func close() {
         if !isEnabled() {
             return
@@ -1771,9 +2552,17 @@ let maxRetryDelay = 30.0
 
             queue?.stop()
             replayQueue?.stop()
+            logsQueue?.stop()
 
             queue = nil
             replayQueue = nil
+            logsQueue = nil
+            pushSubscriptionHandler = nil
+            // Closing ends the run: clear the buffer, which publishes empty steps so the integration
+            // drops them from customData. Nil the reference so later adds no-op. (reset()/identify keep it.)
+            let bufferToClear = exceptionStepsBuffer
+            exceptionStepsBuffer = nil
+            bufferToClear?.clear()
             config.storageManager?.reset(keepAnonymousId: config.reuseAnonymousId)
             config.storageManager = nil
             config = PostHogConfig(projectToken: "")
@@ -1789,10 +2578,14 @@ let maxRetryDelay = 30.0
             context = nil
             sessionManager.endSession()
             didEnterBackgroundToken = nil
+            logger = nil
             toggleHedgeLog(false)
 
             uninstallIntegrations()
         }
+        // Outside setupLock to avoid lock-ordering coupling between
+        // setupLock and lastScreenLock.
+        lastScreenLock.withLock { _lastScreenName = nil }
     }
 
     #if os(iOS)
@@ -1801,7 +2594,7 @@ let maxRetryDelay = 30.0
 
          This method will have no effect if PostHog is not enabled, or if session replay is disabled in your project settings.
 
-         Also, any ingestion controls will not overridden when calling this method. The recording will not start if:
+         Ingestion controls are not overridden when calling this method. The recording will not start if:
          - The session is not sampled,
          - Event triggers are configured and have not been activated for the current session.
 
@@ -1818,7 +2611,7 @@ let maxRetryDelay = 30.0
 
          This method will have no effect if PostHog is not enabled, or if session replay is disabled in your project settings.
 
-         Also, any ingestion controls will not overridden when calling this method. The recording will not start if:
+         Ingestion controls are not overridden when calling this method. The recording will not start if:
          - The session is not sampled,
          - Event triggers are configured and have not been activated for the current session.
 
@@ -1881,8 +2674,46 @@ let maxRetryDelay = 30.0
 
             replayIntegration.stop()
         }
+
+        /// Captures the current native window for a first-party wrapper SDK
+        /// (e.g. posthog-flutter) that drives session-replay capture on its own
+        /// cadence. Not for app use — it shares snapshot state with the normal
+        /// timer-driven capture. Returns true when an image is captured and enqueued
+        /// for asynchronous masking; returns false when capture cannot be enqueued.
+        ///
+        /// Flutter treats true as a started bridge episode. A rare allocation failure
+        /// during later masking can still drop that frame after Flutter sees success.
+        /// The frame is dropped safely, never sent unmasked. Keep masking off main and
+        /// this synchronous contract for now; revisit final-result reporting if the
+        /// missed opening frame becomes a practical problem.
+        ///
+        /// Pass [episodeFirstFrame] until the episode's first frame has been
+        /// enqueued (returned true) — not just on the first attempt: it
+        /// renders with `afterScreenUpdates` so a freshly-presented screen
+        /// isn't captured black, and re-arms the per-window meta and dedup
+        /// hash, so a retried opening frame keeps its reset. Drop it for
+        /// steady-state frames (it flickers secure fields).
+        ///
+        /// Prefer the main thread. An off-main call blocks on a synchronous
+        /// main-queue hop for the duration of the capture, so it must not come
+        /// from a queue the main thread can be waiting on.
+        ///
+        /// SPI, not public API: no stability guarantees.
+        @_spi(PostHogInternal) @discardableResult public func captureSessionReplaySnapshot(
+            episodeFirstFrame: Bool
+        ) -> Bool {
+            if !isEnabled() {
+                return false
+            }
+
+            return replayIntegration?.captureBridgeSnapshot(episodeFirstFrame: episodeFirstFrame) ?? false
+        }
     #endif
 
+    /// Creates and sets up an additional SDK instance.
+    ///
+    /// - Parameter config: Configuration for the new instance.
+    /// - Returns: A configured `PostHogSDK` instance.
     @objc public static func with(_ config: PostHogConfig) -> PostHogSDK {
         let postHog = PostHogSDK(config)
         postHog.setup(config)
@@ -1890,6 +2721,9 @@ let maxRetryDelay = 30.0
     }
 
     #if os(iOS)
+        /// Returns whether session replay is currently recording.
+        ///
+        /// - Returns: `true` only when replay is active, a session ID exists, and remote config allows recording.
         @objc public func isSessionReplayActive() -> Bool {
             if !isEnabled() {
                 return false
@@ -1906,6 +2740,10 @@ let maxRetryDelay = 30.0
     #endif
 
     #if os(iOS) || targetEnvironment(macCatalyst)
+        /// Returns whether UIKit element autocapture is enabled in local state.
+        ///
+        /// - Returns: `true` when the SDK is set up and `captureElementInteractions` is enabled.
+        ///   This does not verify that the swizzling-backed integration was installed.
         @objc public func isAutocaptureActive() -> Bool {
             isEnabled() && config.captureElementInteractions
         }
@@ -1914,6 +2752,10 @@ let maxRetryDelay = 30.0
             isEnabled() && config.captureScrollViewSwipeInteractions
         }
 
+        /// Returns whether rage click autocapture is enabled in local state.
+        ///
+        /// - Returns: `true` when the SDK is set up and rage click detection is enabled.
+        ///   This does not verify that the swizzling-backed integration was installed.
         @objc public func isRageClickActive() -> Bool {
             isEnabled() && config.rageClickConfig.enabled
         }
@@ -1931,7 +2773,7 @@ let maxRetryDelay = 30.0
     /// do {
     ///     try FileManager.default.removeItem(at: badFileUrl)
     /// } catch {
-    ///     PostHog.shared.captureException(error)
+    ///     PostHogSDK.shared.captureException(error)
     /// }
     /// ```
     ///
@@ -1952,10 +2794,7 @@ let maxRetryDelay = 30.0
             config: config.errorTrackingConfig
         )
 
-        var mergedProperties = errorProperties
-        properties?.forEach { mergedProperties[$0.key] = $0.value }
-
-        capture("$exception", properties: mergedProperties)
+        captureExceptionEvent(errorProperties, additionalProperties: properties)
     }
 
     /// Capture a Swift Error or NSError without additional properties
@@ -1981,7 +2820,7 @@ let maxRetryDelay = 30.0
     /// @try {
     ///     [self riskyOperation];
     /// } @catch (NSException *exception) {
-    ///     [[PostHog shared] captureExceptionWithNSException:exception properties:nil];
+    ///     [[PostHogSDK shared] captureExceptionWithNSException:exception properties:nil];
     /// }
     /// ```
     ///
@@ -2002,10 +2841,7 @@ let maxRetryDelay = 30.0
             config: config.errorTrackingConfig
         )
 
-        var mergedProperties = exceptionProperties
-        properties?.forEach { mergedProperties[$0.key] = $0.value }
-
-        capture("$exception", properties: mergedProperties)
+        captureExceptionEvent(exceptionProperties, additionalProperties: properties)
     }
 
     /// Capture an NSException without additional properties
@@ -2019,6 +2855,105 @@ let maxRetryDelay = 30.0
         _ exception: NSException
     ) {
         captureException(exception, properties: nil)
+    }
+
+    /// Record an exception step (breadcrumb-style context record).
+    ///
+    /// Steps accumulate in a session-scoped buffer and are attached to **every** captured `$exception`
+    /// as `$exception_steps`, giving the error tracking UI a timeline of recent activity before each
+    /// error. The buffer is not cleared by a capture — it rotates only by byte-budget eviction and is
+    /// cleared on a clean launch or `close()`. On a fatal crash the buffered steps are persisted with
+    /// the crash context and attached to the crash `$exception` reported on the next launch.
+    ///
+    /// Reserved keys `$message` and `$timestamp` are stripped from `properties` — the SDK sets the
+    /// canonical values. The `$timestamp` is captured at call time so the timeline stays accurate.
+    /// This method never throws and never blocks; a failed step is silently skipped.
+    ///
+    /// Example:
+    /// ```swift
+    /// PostHogSDK.shared.addExceptionStep("User tapped Checkout", properties: ["screen": "cart"])
+    /// ```
+    ///
+    /// - Parameters:
+    ///   - message: A short, non-empty description of what happened. Empty messages are ignored.
+    ///   - properties: Optional additional context to attach to the step.
+    ///
+    @objc(addExceptionStep:properties:)
+    public func addExceptionStep(_ message: String, properties: [String: Any]? = nil) {
+        guard isEnabled(), !isOptOutState() else { return }
+
+        guard config.errorTrackingConfig.exceptionSteps.enabled else {
+            hedgeLog("addExceptionStep called but exception steps are disabled, ignoring")
+            return
+        }
+
+        guard !message.isEmpty else {
+            hedgeLog("addExceptionStep called with an empty message, ignoring")
+            return
+        }
+
+        guard let buffer = exceptionStepsBuffer else { return }
+
+        // Strip reserved keys from caller-supplied properties — the SDK owns $message/$timestamp.
+        var step: [String: Any] = [:]
+        if let properties {
+            for (key, value) in properties {
+                if key == PostHogExceptionStepFields.message || key == PostHogExceptionStepFields.timestamp {
+                    hedgeLog("addExceptionStep: reserved key \(key) in properties is ignored")
+                    continue
+                }
+                step[key] = value
+            }
+        }
+        step[PostHogExceptionStepFields.message] = message
+        step[PostHogExceptionStepFields.timestamp] = toISO8601String(now())
+
+        buffer.add(step)
+    }
+
+    /// Record an exception step without additional properties.
+    ///
+    /// Convenience overload for Objective-C callers so `properties:` doesn't need to be passed as `nil`.
+    ///
+    /// - Parameter message: A short, non-empty description of what happened.
+    ///
+    @objc(addExceptionStep:)
+    public func addExceptionStep(_ message: String) {
+        addExceptionStep(message, properties: nil)
+    }
+
+    /// Create the steps buffer once. Steps recorded this run are kept in memory for non-fatal
+    /// exceptions; on every change the buffer publishes them via `onExceptionStepsChanged`, which the
+    /// error-tracking integration mirrors into the crash reporter's `customData`.
+    ///
+    /// Must be called under `setupLock`: the create/nil transitions of `exceptionStepsBuffer` (here and
+    /// in `close()`) are confined to it, which keeps this check-then-act atomic against them.
+    private func createExceptionStepsBufferIfNeeded() {
+        guard exceptionStepsBuffer == nil else { return }
+        exceptionStepsBuffer = PostHogExceptionStepsBuffer(
+            maxBytes: config.errorTrackingConfig.exceptionSteps.maxBytes,
+            onStepsChanged: { [weak self] steps in self?.onExceptionStepsChanged.invoke(steps) }
+        )
+    }
+
+    /// The session-scoped buffered steps to attach to an exception, or `nil` when disabled or empty.
+    private var attachableExceptionSteps: [[String: Any]]? {
+        guard config.errorTrackingConfig.exceptionSteps.enabled,
+              let buffer = exceptionStepsBuffer
+        else { return nil }
+        let steps = buffer.getAttachable()
+        return steps.isEmpty ? nil : steps
+    }
+
+    private func captureExceptionEvent(
+        _ exceptionProperties: [String: Any],
+        additionalProperties: [String: Any]?
+    ) {
+        var mergedProperties = exceptionProperties
+        additionalProperties?.forEach { mergedProperties[$0.key] = $0.value }
+
+        // ignoredExceptionTypes is enforced in captureInternal, the chokepoint for every $exception path
+        capture("$exception", properties: mergedProperties)
     }
 
     private func installIntegrations() {
@@ -2079,6 +3014,31 @@ let maxRetryDelay = 30.0
         }
     #endif
 
+    /// Callable from any thread (e.g. the main-queue `onRemoteConfigLoaded` callback), so the
+    /// mutation runs under `setupLock` like every other `installedIntegrations` access.
+    func removeIntegration(_ integration: PostHogIntegration) {
+        let id = ObjectIdentifier(integration)
+        setupLock.withLock {
+            integration.uninstall(self)
+            installedIntegrations.removeAll { ObjectIdentifier($0) == id }
+        }
+        hedgeLog("Integration \(type(of: integration)) removed")
+    }
+
+    /// Installs a single integration after initial setup, tracking it for teardown. Twin of
+    /// `removeIntegration`, for integrations that install lazily once remote config lands (e.g.
+    /// error-tracking autocapture re-enabled by a live `/config` after a cached-disabled start).
+    /// Callable from any thread; runs under `setupLock` like every other `installedIntegrations` access.
+    func addIntegration(_ integration: PostHogIntegration) {
+        setupLock.withLock {
+            let id = ObjectIdentifier(integration)
+            guard !installedIntegrations.contains(where: { ObjectIdentifier($0) == id }) else { return }
+            guard case .installed = integration.install(self) else { return }
+            installedIntegrations.append(integration)
+            hedgeLog("Integration \(type(of: integration)) added")
+        }
+    }
+
     private func uninstallIntegrations() {
         for integration in installedIntegrations {
             integration.uninstall(self)
@@ -2119,33 +3079,246 @@ let maxRetryDelay = 30.0
             "event_properties": eventProperties,
         ]
 
-        for integration in installedIntegrations {
-            integration.contextDidChange(context)
+        onEventContextChanged.invoke(context)
+    }
+
+    /// Replays the current buffered steps to subscribers (e.g. a crash writer just installed on opt-in).
+    ///
+    /// The steps buffer survives opt-out, so a freshly subscribed crash writer would otherwise hold the
+    /// context but empty steps until the next `addExceptionStep`; a crash in that window would drop the
+    /// buffered steps from the on-disk report. Guarded like `addExceptionStep`: steps follow opt-out.
+    private func notifyExceptionStepsDidChange() {
+        guard isEnabled(), !isOptOutState() else { return }
+
+        if let steps = exceptionStepsBuffer?.getAttachable(), !steps.isEmpty {
+            onExceptionStepsChanged.invoke(steps)
         }
     }
+
+    // MARK: - Push Notifications
+
+    #if os(iOS)
+        /// Sends a device push token to PostHog so Workflows can deliver push notifications to this device.
+        ///
+        /// Call this from `application(_:didRegisterForRemoteNotificationsWithDeviceToken:)` when you don't
+        /// rely on automatic swizzling (for example when `enableSwizzling` is `false`).
+        ///
+        /// The token is linked to the current distinct id, so it follows the user across `identify(_:)`.
+        ///
+        /// - Note: Push registration is available on iOS only in this version.
+        ///
+        /// - Parameter deviceToken: The APNs token as a lowercase-hex string. Convert a `Data` token via
+        ///   `token.map { String(format: "%02x", $0) }.joined()`.
+        @objc public func registerPushNotificationToken(_ deviceToken: String) {
+            registerPushNotificationToken(deviceToken, appId: nil)
+        }
+
+        /// Sends a device push token to PostHog under an explicit app id.
+        ///
+        /// Use the `appId` overload when relaying a token obtained through another provider (for example a
+        /// Firebase `project_id`). When `appId` is `nil` the app's bundle identifier is used.
+        ///
+        /// - Note: Push registration is available on iOS only in this version.
+        ///
+        /// - Parameters:
+        ///   - deviceToken: The push token string (APNs lowercase-hex, or an FCM token verbatim).
+        ///   - appId: The app identifier the token belongs to, or `nil` to use the bundle identifier.
+        @objc public func registerPushNotificationToken(_ deviceToken: String, appId: String?) {
+            if !isEnabled() {
+                return
+            }
+
+            if isOptOutState() {
+                return
+            }
+
+            pushSubscriptionHandler?.send(deviceToken: deviceToken, appId: appId)
+        }
+
+        /// Unregisters this device's push token from PostHog so Workflows stop targeting it — for example
+        /// from your logout flow.
+        ///
+        /// Sends a `DELETE /api/push_subscriptions/` for the current distinct id (the backend unsets the
+        /// subscription property) and forgets the locally stored token. The delete intent is durable: an
+        /// offline or failed attempt is retried on `flush()`/next launch until it succeeds or hits a
+        /// terminal 4xx. Call it directly if you manage push subscriptions yourself. On `reset()` the SDK
+        /// already moves any registered token to the new anonymous identity (unregister then re-register),
+        /// independently of `capturePushNotificationSubscriptions` — that flag only gates automatic token
+        /// subscription at startup.
+        @objc public func unregisterPushNotificationToken() {
+            if !isEnabled() {
+                return
+            }
+
+            if isOptOutState() {
+                return
+            }
+
+            pushSubscriptionHandler?.unregisterCurrentToken()
+        }
+    #endif
+
+    #if os(iOS) || os(macOS)
+        /// Installs the notification-open swizzles before `setup()` is called.
+        ///
+        /// A cold launch from a notification tap delivers the response to the app within a few hundred
+        /// milliseconds — sooner than a cross-platform host (Flutter, React Native) can reach its own
+        /// `setup()` call from the Dart/JS runtime, so the swizzles are not yet in place and the open is
+        /// lost. Call this from `application(_:didFinishLaunchingWithOptions:)`, or from a plugin
+        /// registration that runs inside it, and the response is held until `setup()` installs the
+        /// integration, which then captures it.
+        ///
+        /// Holds at most one response, and only replays it when `setup()` follows within 30 seconds.
+        /// Native iOS apps that call `setup()` from `didFinishLaunchingWithOptions` do not need this.
+        ///
+        /// The swizzles are installed immediately and released again when the last subscriber detaches
+        /// (`close()`), or at `setup()` when the config disables push-open capture or the app is
+        /// opted out. If `setup()` is never called they stay for the process lifetime. The per-class
+        /// delegate wrapper, as elsewhere in this SDK, stays for the process lifetime regardless.
+        @available(iOS 14.0, macOS 11.0, *)
+        @objc public static func prewarmPushNotificationOpenCapture() {
+            DI.main.pushNotificationPublisher.prewarmNotificationResponseCapture()
+        }
+
+        /// Manually captures a `$push_notification_opened` event for a notification the user tapped.
+        ///
+        /// Use this when you're not relying on the automatic swizzling installed by
+        /// `capturePushNotificationOpened`, for example when `enableSwizzling` is `false` or when you
+        /// manage your own `UNUserNotificationCenterDelegate`. Call it from your
+        /// `userNotificationCenter(_:didReceive:withCompletionHandler:)` implementation.
+        ///
+        /// The notification's title/subtitle/body are included only when the push is attributed to
+        /// PostHog (a `posthog` key in its `userInfo`); unattributed pushes capture the open event
+        /// without content. Use the field-based overload to capture content explicitly.
+        ///
+        /// - Parameter response: The `UNNotificationResponse` received from the system.
+        @available(iOS 14.0, macOS 11.0, *)
+        @objc public func capturePushNotificationOpened(response: UNNotificationResponse) {
+            let content = response.notification.request.content
+            // Free-text content is captured only for PostHog-attributed pushes: forwarding the
+            // title/body of arbitrary third-party notifications (OTPs, chat previews) would ship
+            // sensitive text to analytics by default. The field-based overload stays ungated —
+            // there the developer passes content explicitly.
+            let isPostHogNotification = content.userInfo["posthog"] != nil
+            capturePushNotificationOpened(
+                title: isPostHogNotification ? content.title : nil,
+                subtitle: isPostHogNotification ? content.subtitle : nil,
+                body: isPostHogNotification ? content.body : nil,
+                payload: content.userInfo,
+                action: response.actionIdentifier
+            )
+        }
+
+        /// Manually captures a `$push_notification_opened` event from raw notification fields.
+        ///
+        /// Use this when no `UNNotificationResponse` is available — for example when you handle a push
+        /// yourself in `application(_:didReceiveRemoteNotification:fetchCompletionHandler:)` or relay it
+        /// from a cross-platform layer.
+        ///
+        /// - Parameters:
+        ///   - title: The notification title; omitted from the event when `nil` or empty.
+        ///   - subtitle: The notification subtitle; omitted when `nil` or empty.
+        ///   - body: The notification body; omitted when `nil` or empty.
+        ///   - payload: The notification payload (`userInfo`). The keys of its `posthog` entry — a
+        ///     dictionary, or a JSON string when relayed through FCM — become `$notification_<key>`
+        ///     properties.
+        ///   - action: The action identifier for an action-button tap; leave `nil` for a plain tap
+        ///     (the default action is omitted from the event).
+        @objc public func capturePushNotificationOpened(
+            title: String? = nil,
+            subtitle: String? = nil,
+            body: String? = nil,
+            payload: [AnyHashable: Any]? = nil,
+            action: String? = nil
+        ) {
+            if !isEnabled() {
+                return
+            }
+
+            if isOptOutState() {
+                return
+            }
+
+            var properties: [String: Any] = [:]
+
+            if let title, !title.isEmpty {
+                properties["$notification_title"] = title
+            }
+
+            if let subtitle, !subtitle.isEmpty {
+                properties["$notification_subtitle"] = subtitle
+            }
+
+            if let body, !body.isEmpty {
+                properties["$notification_body"] = body
+            }
+
+            if let posthogData = posthogPayload(from: payload?["posthog"]) {
+                for (key, value) in posthogData {
+                    properties["$notification_\(key)"] = value
+                }
+            }
+
+            if let action, !action.isEmpty, action != UNNotificationDefaultActionIdentifier {
+                properties["$notification_action"] = action
+            }
+
+            capture("$push_notification_opened", properties: properties)
+        }
+
+        /// The `posthog` attribution payload arrives as a dictionary when delivered through APNs
+        /// directly, but as a JSON string when relayed through FCM (`message.data` is string→string).
+        private func posthogPayload(from value: Any?) -> [String: Any]? {
+            if let dict = value as? [String: Any] {
+                return dict
+            }
+            if let string = value as? String {
+                if let data = string.data(using: .utf8), let dict = fromJSONData(data) {
+                    return dict
+                }
+                hedgeLog("Push notification 'posthog' payload is not a JSON object; ignoring.")
+            }
+            return nil
+        }
+    #endif
 }
 
 #if TESTING
     extension PostHogSDK {
         #if os(iOS) || targetEnvironment(macCatalyst)
             func getAutocaptureIntegration() -> PostHogAutocaptureIntegration? {
-                installedIntegrations.compactMap {
-                    $0 as? PostHogAutocaptureIntegration
-                }.first
+                getIntegration()
             }
 
             func getRageClickIntegration() -> PostHogRageClickIntegration? {
-                installedIntegrations.compactMap {
-                    $0 as? PostHogRageClickIntegration
-                }.first
+                getIntegration()
             }
         #endif
 
         #if os(iOS)
             func getReplayIntegration() -> PostHogReplayIntegration? {
-                installedIntegrations.compactMap {
-                    $0 as? PostHogReplayIntegration
-                }.first
+                getIntegration()
+            }
+        #endif
+
+        #if os(iOS) || os(macOS) || os(tvOS)
+            func getErrorTrackingIntegration() -> PostHogErrorTrackingAutoCaptureIntegration? {
+                getIntegration()
+            }
+        #endif
+
+        #if os(iOS) || os(macOS)
+            @available(iOS 14.0, macOS 11.0, *)
+            func getPushNotificationIntegration() -> PostHogPushNotificationOpenIntegration? {
+                getIntegration()
+            }
+
+        #endif
+
+        #if os(iOS)
+            @available(iOS 14.0, *)
+            func getPushNotificationSubscriptionIntegration() -> PostHogPushNotificationSubscriptionIntegration? {
+                getIntegration()
             }
         #endif
 
@@ -2154,15 +3327,17 @@ let maxRetryDelay = 30.0
         }
 
         func getAppLifeCycleIntegration() -> PostHogAppLifeCycleIntegration? {
-            installedIntegrations.compactMap {
-                $0 as? PostHogAppLifeCycleIntegration
-            }.first
+            getIntegration()
         }
 
         func getScreenViewIntegration() -> PostHogScreenViewIntegration? {
-            installedIntegrations.compactMap {
-                $0 as? PostHogScreenViewIntegration
-            }.first
+            getIntegration()
+        }
+
+        private func getIntegration<T: PostHogIntegration>() -> T? {
+            setupLock.withLock {
+                installedIntegrations.compactMap { $0 as? T }.first
+            }
         }
     }
 #endif

@@ -27,6 +27,12 @@ class PostHogConfigTest: QuickSpec {
             expect(config.captureScreenViews) == true
             expect(config.debug) == false
             expect(config.optOut) == false
+
+            #if os(iOS) || os(macOS)
+                expect(config.capturePushNotificationSubscriptions) == true
+                expect(config.capturePushNotificationOpened) == true
+            #endif
+            expect(config.pushIdentityProvider).to(beNil())
         }
 
         it("init takes project token") {
@@ -96,7 +102,7 @@ class PostHogConfigTest: QuickSpec {
 
             context("when initialized with default tracing headers configuration") {
                 it("should disable tracing headers by default") {
-                    let sut = PostHogConfig(apiKey: testAPIKey)
+                    let sut = PostHogConfig(projectToken: testProjectToken)
                     expect(sut.tracingHeaders).to(beNil())
                 }
             }

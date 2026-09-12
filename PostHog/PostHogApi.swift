@@ -7,38 +7,126 @@
 
 import Foundation
 
+/// Common URLSession upload-response handler shared by `/batch`, `/snapshot`,
+/// and `/i/v1/logs`. Routes through `as?` so a missing HTTP response can't
+/// crash inside a customer process.
+func processUploadResponse(
+    endpointName: String,
+    data: Data?,
+    response: URLResponse?,
+    error: Error?,
+    completion: @escaping (PostHogUploadInfo) -> Void
+) {
+    let httpResponse = response as? HTTPURLResponse
+    // Parsed before the error branch: URLSession can deliver headers and then fail the
+    // transfer, and a rate-limited response still carries the delay the server asked for.
+    let retryAfter = httpResponse.flatMap { $0.value(forHTTPHeaderField: "Retry-After") }.flatMap(parseRetryAfter)
+
+    if let error {
+        hedgeLog("Error calling the \(endpointName) API: \(error).")
+        // A 3xx left on a failed task is the redirect URLSession was still following, not an
+        // outcome for the payload, so it's reported as no status. Honoring it would let the
+        // policies that treat 3xx as terminal (logs, push unregister) delete durable records
+        // that never reached the final host.
+        let status = httpResponse?.statusCode
+        let delivered = status.flatMap { 300 ... 399 ~= $0 ? nil : $0 }
+        return completion(PostHogUploadInfo(statusCode: delivered, error: error, retryAfter: retryAfter))
+    }
+
+    guard let httpResponse else {
+        hedgeLog("\(endpointName) API returned no HTTP response")
+        return completion(PostHogUploadInfo(statusCode: nil, error: nil))
+    }
+
+    if !(200 ... 299 ~= httpResponse.statusCode) {
+        let jsonBody = data.flatMap { fromJSONData($0, options: .allowFragments) }
+        hedgeLog("Error sending to \(endpointName) API: status: \(httpResponse.statusCode), body: \(String(describing: jsonBody)).")
+    } else {
+        hedgeLog("\(endpointName) sent successfully.")
+    }
+
+    completion(PostHogUploadInfo(statusCode: httpResponse.statusCode, error: nil, retryAfter: retryAfter))
+}
+
 class PostHogApi {
+    static var gzipData: (Data) throws -> Data = { try $0.gzipped() }
+
     private let config: PostHogConfig
+
+    /// Snapshot at init; treated as immutable after setup.
+    private let customRequestHeaders: [String: String]
 
     // default is 60s but we do 10s
     private let defaultTimeout: TimeInterval = 10
 
+    /// Shared so connection pool, TLS state, and HTTP/2 streams survive
+    /// between calls instead of being torn down per request.
+    private let session: URLSession
+
+    static let flagsRetryDelay: TimeInterval = 0.3
+
     init(_ config: PostHogConfig) {
         self.config = config
+        customRequestHeaders = config.requestHeaders ?? [:]
+
+        // Copy first so SDK mutations don't leak back to the caller's object.
+        let sessionConfig = (config.urlSessionConfiguration?.copy() as? URLSessionConfiguration)
+            ?? URLSessionConfiguration.default
+        // Conditional request (If-Modified-Since/If-None-Match): server returns
+        // 304 → cache hit, otherwise fresh body. Needed for /array/<token>/config
+        // so we don't operate on stale config or flags.
+        sessionConfig.requestCachePolicy = .reloadRevalidatingCacheData
+        // Merge over caller-supplied headers; SDK keys overwrite collisions.
+        var headers = sessionConfig.httpAdditionalHeaders ?? [:]
+        headers["Content-Type"] = "application/json; charset=utf-8"
+        headers["User-Agent"] = "\(postHogSdkName)/\(postHogVersion)"
+        headers["Accept-Encoding"] = "gzip"
+        sessionConfig.httpAdditionalHeaders = headers
+        // Strip custom headers on cross-host redirects so they don't leak to another origin.
+        if customRequestHeaders.isEmpty {
+            session = URLSession(configuration: sessionConfig)
+        } else {
+            let stripper = PostHogRedirectHeaderStripper(allowedHost: config.host.host, headerKeys: Array(customRequestHeaders.keys))
+            session = URLSession(configuration: sessionConfig, delegate: stripper, delegateQueue: nil)
+        }
     }
 
-    func sessionConfig() -> URLSessionConfiguration {
-        // Use custom configuration if provided, otherwise use default
-        let config = self.config.urlSessionConfiguration ?? URLSessionConfiguration.default
-
-        // Sends a conditional request (If-Modified-Since/If-None-Match) to the server.
-        // If server returns 304 Not Modified, uses cache; otherwise downloads fresh data.
-        // This only affects static resources like /config and it ensures that we don't operate with stale config or flags.
-        config.requestCachePolicy = .reloadRevalidatingCacheData
-
-        config.httpAdditionalHeaders = [
-            "Content-Type": "application/json; charset=utf-8",
-            "User-Agent": "\(postHogSdkName)/\(postHogVersion)",
-        ]
-
-        return config
-    }
-
-    private func getURLRequest(_ url: URL) -> URLRequest {
+    /// `gzipped: true` adds `Content-Encoding: gzip` for upload endpoints
+    /// (/batch, /s/, /i/v1/logs) whose bodies are gzipped.
+    private func getURLRequest(_ url: URL, gzipped: Bool = false, httpMethod: String = "POST") -> URLRequest {
         var request = URLRequest(url: url)
-        request.httpMethod = "POST"
+        request.httpMethod = httpMethod
         request.timeoutInterval = defaultTimeout
+        applyCustomHeaders(&request)
+        if gzipped {
+            request.setValue("gzip", forHTTPHeaderField: "Content-Encoding")
+        }
         return request
+    }
+
+    /// Adds custom headers to requests for the configured host, skipping SDK-managed keys.
+    private func applyCustomHeaders(_ request: inout URLRequest) {
+        guard !customRequestHeaders.isEmpty, request.url?.host == config.host.host else { return }
+        for (key, value) in customRequestHeaders
+            where request.value(forHTTPHeaderField: key) == nil
+            && !Self.reservedHeaderKeys.contains(key.lowercased())
+        {
+            request.setValue(value, forHTTPHeaderField: key)
+        }
+    }
+
+    /// SDK-managed headers that custom values can't override (compared lowercase).
+    private static let reservedHeaderKeys: Set<String> = [
+        "content-type", "user-agent", "accept-encoding", "content-encoding",
+    ]
+
+    private func requestAndPayload(url: URL, data: Data, endpointName: String, httpMethod: String = "POST") -> (URLRequest, Data) {
+        do {
+            return (getURLRequest(url, gzipped: true, httpMethod: httpMethod), try Self.gzipData(data))
+        } catch {
+            hedgeLog("Error gzipping the \(endpointName) body, sending it uncompressed: \(error).")
+            return (getURLRequest(url, httpMethod: httpMethod), data)
+        }
     }
 
     private func getEndpointURL(
@@ -76,113 +164,161 @@ class PostHogApi {
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
         request.timeoutInterval = defaultTimeout
+        applyCustomHeaders(&request)
         return request
     }
 
-    func batch(events: [PostHogEvent], completion: @escaping (PostHogBatchUploadInfo) -> Void) {
+    func batch(events: [PostHogEvent], completion: @escaping (PostHogUploadInfo) -> Void) {
         guard let url = getEndpointURL("/batch", relativeTo: config.host) else {
             hedgeLog("Malformed batch URL error.")
-            return completion(PostHogBatchUploadInfo(statusCode: nil, error: nil))
+            return completion(PostHogUploadInfo(statusCode: nil, error: nil))
         }
-
-        let config = sessionConfig()
-        var headers = config.httpAdditionalHeaders ?? [:]
-        headers["Accept-Encoding"] = "gzip"
-        headers["Content-Encoding"] = "gzip"
-        config.httpAdditionalHeaders = headers
-
-        let request = getURLRequest(url)
 
         let toSend: [String: Any] = [
             // Wire field name remains api_key, but it carries the PostHog project token.
-            "api_key": self.config.projectToken,
+            "api_key": config.projectToken,
             "batch": events.map { $0.toJSON() },
             "sent_at": toISO8601String(Date()),
         ]
 
         guard let data = try? JSONSerialization.data(withJSONObject: toSend) else {
             hedgeLog("Error parsing the batch body")
-            return completion(PostHogBatchUploadInfo(statusCode: nil, error: nil))
+            return completion(PostHogUploadInfo(statusCode: nil, error: nil))
         }
 
-        var gzippedPayload: Data?
-        do {
-            gzippedPayload = try data.gzipped()
-        } catch {
-            hedgeLog("Error gzipping the batch body: \(error).")
-            return completion(PostHogBatchUploadInfo(statusCode: nil, error: error))
-        }
+        let (request, payload) = requestAndPayload(url: url, data: data, endpointName: "batch")
 
-        URLSession(configuration: config).uploadTask(with: request, from: gzippedPayload!) { data, response, error in
-            if error != nil {
-                hedgeLog("Error calling the batch API: \(String(describing: error)).")
-                return completion(PostHogBatchUploadInfo(statusCode: nil, error: error))
-            }
-
-            let httpResponse = response as! HTTPURLResponse
-
-            if !(200 ... 299 ~= httpResponse.statusCode) {
-                let jsonBody = data.flatMap { try? JSONSerialization.jsonObject(with: $0, options: .allowFragments) as? [String: Any] }
-                let errorMessage = "Error sending events to batch API: status: \(httpResponse.statusCode), body: \(String(describing: jsonBody))."
-                hedgeLog(errorMessage)
-            } else {
-                hedgeLog("Events sent successfully.")
-            }
-
-            return completion(PostHogBatchUploadInfo(statusCode: httpResponse.statusCode, error: error))
+        session.uploadTask(with: request, from: payload) { data, response, error in
+            processUploadResponse(endpointName: "batch", data: data, response: response, error: error, completion: completion)
         }.resume()
     }
 
-    func snapshot(events: [PostHogEvent], completion: @escaping (PostHogBatchUploadInfo) -> Void) {
+    func snapshot(events: [PostHogEvent], completion: @escaping (PostHogUploadInfo) -> Void) {
         guard let url = getEndpointURL(config.snapshotEndpoint, relativeTo: config.host) else {
             hedgeLog("Malformed snapshot URL error.")
-            return completion(PostHogBatchUploadInfo(statusCode: nil, error: nil))
+            return completion(PostHogUploadInfo(statusCode: nil, error: nil))
         }
 
         for event in events {
-            event.apiKey = self.config.projectToken
+            event.apiKey = config.projectToken
         }
-
-        let config = sessionConfig()
-        var headers = config.httpAdditionalHeaders ?? [:]
-        headers["Accept-Encoding"] = "gzip"
-        headers["Content-Encoding"] = "gzip"
-        config.httpAdditionalHeaders = headers
-
-        let request = getURLRequest(url)
 
         let toSend = events.map { $0.toJSON() }
 
         guard let data = try? JSONSerialization.data(withJSONObject: toSend) else {
             hedgeLog("Error parsing the snapshot body")
-            return completion(PostHogBatchUploadInfo(statusCode: nil, error: nil))
+            return completion(PostHogUploadInfo(statusCode: nil, error: nil))
         }
 
-        var gzippedPayload: Data?
-        do {
-            gzippedPayload = try data.gzipped()
-        } catch {
-            hedgeLog("Error gzipping the snapshot body: \(error).")
-            return completion(PostHogBatchUploadInfo(statusCode: nil, error: error))
+        let (request, payload) = requestAndPayload(url: url, data: data, endpointName: "snapshot")
+
+        session.uploadTask(with: request, from: payload) { data, response, error in
+            processUploadResponse(endpointName: "snapshot", data: data, response: response, error: error, completion: completion)
+        }.resume()
+    }
+
+    /// POSTs an OpenTelemetry log payload to `/i/v1/logs?token=<projectToken>`.
+    /// The token is carried in the query string because the endpoint expects it
+    /// there rather than in the body.
+    ///
+    /// - Parameter completion: Invoked exactly once on every code path (including
+    ///   early-return errors) so the calling queue's `isFlushing` flag clears.
+    func logs(payload: [String: Any], completion: @escaping (PostHogUploadInfo) -> Void) {
+        let url = getEndpointURL(
+            "/i/v1/logs",
+            queryItems: URLQueryItem(name: "token", value: config.projectToken),
+            relativeTo: config.host
+        )
+        guard let url else {
+            hedgeLog("Malformed logs URL error.")
+            return completion(PostHogUploadInfo(statusCode: nil, error: nil))
         }
 
-        URLSession(configuration: config).uploadTask(with: request, from: gzippedPayload!) { data, response, error in
-            if error != nil {
-                hedgeLog("Error calling the snapshot API: \(String(describing: error)).")
-                return completion(PostHogBatchUploadInfo(statusCode: nil, error: error))
-            }
+        guard let data = try? JSONSerialization.data(withJSONObject: payload) else {
+            hedgeLog("Error parsing the logs body")
+            return completion(PostHogUploadInfo(statusCode: nil, error: nil))
+        }
 
-            let httpResponse = response as! HTTPURLResponse
+        let (request, uploadPayload) = requestAndPayload(url: url, data: data, endpointName: "logs")
 
-            if !(200 ... 299 ~= httpResponse.statusCode) {
-                let jsonBody = data.flatMap { try? JSONSerialization.jsonObject(with: $0, options: .allowFragments) as? [String: Any] }
-                let errorMessage = "Error sending events to snapshot API: status: \(httpResponse.statusCode), body: \(String(describing: jsonBody))."
-                hedgeLog(errorMessage)
-            } else {
-                hedgeLog("Snapshots sent successfully.")
-            }
+        session.uploadTask(with: request, from: uploadPayload) { data, response, error in
+            processUploadResponse(endpointName: "logs", data: data, response: response, error: error, completion: completion)
+        }.resume()
+    }
 
-            return completion(PostHogBatchUploadInfo(statusCode: httpResponse.statusCode, error: error))
+    /// Registers a device push token with PostHog so Workflows can deliver push notifications.
+    /// `platform` is always `ios`: registration is iOS-only in v1 (the backend rejects `macos`).
+    ///
+    /// - Parameter completion: Invoked exactly once on every code path with the HTTP status and any
+    ///   `Retry-After` header, so the caller can apply the shared retry/backoff policy.
+    func pushSubscription(
+        distinctId: String,
+        deviceToken: String,
+        appId: String,
+        identityToken: String?,
+        completion: @escaping (PostHogUploadInfo) -> Void
+    ) {
+        sendPushSubscription(
+            httpMethod: "POST", endpointName: "push subscription",
+            distinctId: distinctId, deviceToken: deviceToken, appId: appId,
+            identityToken: identityToken, completion: completion
+        )
+    }
+
+    /// Unregisters a device token: `DELETE /api/push_subscriptions/` with the same 5-field body as
+    /// registration (the backend `$unset`s `$device_push_subscription_<app_id>`). This call itself
+    /// fires once, but the caller persists a durable "delete" intent before calling it and retries
+    /// passively on `flush()`/next launch (and once on a 401 identity re-mint) until it succeeds.
+    func deletePushSubscription(
+        distinctId: String,
+        deviceToken: String,
+        appId: String,
+        identityToken: String?,
+        completion: @escaping (PostHogUploadInfo) -> Void
+    ) {
+        sendPushSubscription(
+            httpMethod: "DELETE", endpointName: "push unsubscription",
+            distinctId: distinctId, deviceToken: deviceToken, appId: appId,
+            identityToken: identityToken, completion: completion
+        )
+    }
+
+    private func sendPushSubscription(
+        httpMethod: String,
+        endpointName: String,
+        distinctId: String,
+        deviceToken: String,
+        appId: String,
+        identityToken: String?,
+        completion: @escaping (PostHogUploadInfo) -> Void
+    ) {
+        guard let url = getEndpointURL("/api/push_subscriptions/", relativeTo: config.host) else {
+            hedgeLog("Malformed push subscriptions URL error.")
+            return completion(PostHogUploadInfo(statusCode: nil, error: nil))
+        }
+
+        // The token key is omitted entirely when absent — the backend treats a missing key as
+        // "unsigned"; an explicit null would fail its string check.
+        var toSend: [String: Any] = [
+            "api_key": config.projectToken,
+            "distinct_id": distinctId,
+            "device_token": deviceToken,
+            "platform": "ios",
+            "app_id": appId,
+        ]
+        if let identityToken {
+            toSend["identity_token"] = identityToken
+        }
+
+        guard let data = try? JSONSerialization.data(withJSONObject: toSend) else {
+            hedgeLog("Error parsing the \(endpointName) body")
+            return completion(PostHogUploadInfo(statusCode: nil, error: nil))
+        }
+
+        let (request, payload) = requestAndPayload(url: url, data: data, endpointName: endpointName, httpMethod: httpMethod)
+
+        session.uploadTask(with: request, from: payload) { data, response, error in
+            processUploadResponse(endpointName: endpointName, data: data, response: response, error: error, completion: completion)
         }.resume()
     }
 
@@ -206,13 +342,11 @@ class PostHogApi {
             return completion(nil, nil)
         }
 
-        let config = sessionConfig()
-
         let request = getURLRequest(url)
 
         var toSend: [String: Any] = [
             // Wire field name remains api_key, but it carries the PostHog project token.
-            "api_key": self.config.projectToken,
+            "api_key": config.projectToken,
             "distinct_id": distinctId,
             "groups": groups,
             "timezone": TimeZone.current.identifier,
@@ -234,7 +368,7 @@ class PostHogApi {
             toSend["group_properties"] = groupProperties
         }
 
-        if let evaluationContexts = self.config.evaluationContexts, !evaluationContexts.isEmpty {
+        if let evaluationContexts = config.evaluationContexts, !evaluationContexts.isEmpty {
             toSend["evaluation_contexts"] = evaluationContexts
         }
 
@@ -243,9 +377,29 @@ class PostHogApi {
             return completion(nil, nil)
         }
 
-        URLSession(configuration: config).uploadTask(with: request, from: data) { data, response, error in
-            if error != nil {
-                hedgeLog("Error calling the flags API: \(String(describing: error))")
+        uploadFlagsRequest(request, payload: data, retryCount: 0, completion: completion)
+    }
+
+    private func uploadFlagsRequest(
+        _ request: URLRequest,
+        payload: Data,
+        retryCount: Int,
+        completion: @escaping ([String: Any]?, _ error: Error?) -> Void
+    ) {
+        session.uploadTask(with: request, from: payload) { data, response, error in
+            if let error {
+                if Self.isRetryableFlagsError(error), retryCount < self.config.featureFlagRequestMaxRetries {
+                    self.retryFlagsRequest(
+                        request,
+                        payload: payload,
+                        retryCount: retryCount,
+                        reason: String(describing: error),
+                        completion: completion
+                    )
+                    return
+                }
+
+                hedgeLog("Error calling the flags API: \(error)")
                 return completion(nil, error)
             }
 
@@ -254,13 +408,28 @@ class PostHogApi {
                 return completion(nil, nil)
             }
 
-            let httpResponse = response as! HTTPURLResponse
+            guard let httpResponse = response as? HTTPURLResponse else {
+                hedgeLog("Error parsing the flags response: unexpected response type")
+                return completion(nil, nil)
+            }
 
             if !(200 ... 299 ~= httpResponse.statusCode) {
-                let jsonBody = try? JSONSerialization.jsonObject(with: data, options: .allowFragments) as? [String: Any]
-                let errorMessage = "Error calling flags API: status: \(httpResponse.statusCode), body: \(String(describing: jsonBody))."
-                hedgeLog(errorMessage)
+                let jsonBody = fromJSONData(data, options: .allowFragments)
+                let retryReason = "status: \(httpResponse.statusCode), body: \(String(describing: jsonBody))"
+                let errorMessage = "Error calling flags API: \(retryReason)."
 
+                if Self.isRetryableFlagsStatusCode(httpResponse.statusCode), retryCount < self.config.featureFlagRequestMaxRetries {
+                    self.retryFlagsRequest(
+                        request,
+                        payload: payload,
+                        retryCount: retryCount,
+                        reason: retryReason,
+                        completion: completion
+                    )
+                    return
+                }
+
+                hedgeLog(errorMessage)
                 return completion(nil,
                                   InternalPostHogError(description: errorMessage))
             } else {
@@ -277,6 +446,39 @@ class PostHogApi {
         }.resume()
     }
 
+    private func retryFlagsRequest(
+        _ request: URLRequest,
+        payload: Data,
+        retryCount: Int,
+        reason: String,
+        completion: @escaping ([String: Any]?, _ error: Error?) -> Void
+    ) {
+        let nextRetryCount = retryCount + 1
+        let delay = Self.featureFlagsRetryDelay(forFailedAttempt: nextRetryCount)
+        hedgeLog(
+            "Error calling the flags API: \(reason). Retrying in \(delay) seconds (attempt \(nextRetryCount)/\(config.featureFlagRequestMaxRetries))."
+        )
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + delay) {
+            self.uploadFlagsRequest(request, payload: payload, retryCount: nextRetryCount, completion: completion)
+        }
+    }
+
+    static func featureFlagsRetryDelay(forFailedAttempt failedAttempt: Int) -> TimeInterval {
+        min(flagsRetryDelay * pow(2.0, TimeInterval(failedAttempt - 1)), maxRetryDelay)
+    }
+
+    private static func isRetryableFlagsError(_ error: Error) -> Bool {
+        let nsError = error as NSError
+        guard nsError.domain == NSURLErrorDomain else {
+            return false
+        }
+        return nsError.code == NSURLErrorTimedOut || nsError.code == NSURLErrorNetworkConnectionLost
+    }
+
+    private static func isRetryableFlagsStatusCode(_ statusCode: Int) -> Bool {
+        statusCode == 502 || statusCode == 504
+    }
+
     func remoteConfig(
         completion: @escaping ([String: Any]?, _ error: Error?) -> Void
     ) {
@@ -285,9 +487,7 @@ class PostHogApi {
             return
         }
 
-        let config = sessionConfig()
-
-        let task = URLSession(configuration: config).dataTask(with: request) { data, response, error in
+        let task = session.dataTask(with: request) { data, response, error in
             if let error {
                 hedgeLog("Error calling the remote config API: \(error.localizedDescription)")
                 return completion(nil, error)
@@ -298,10 +498,13 @@ class PostHogApi {
                 return completion(nil, nil)
             }
 
-            let httpResponse = response as! HTTPURLResponse
+            guard let httpResponse = response as? HTTPURLResponse else {
+                hedgeLog("Error parsing the remote config response: unexpected response type")
+                return completion(nil, nil)
+            }
 
             if !(200 ... 299 ~= httpResponse.statusCode) {
-                let jsonBody = try? JSONSerialization.jsonObject(with: data, options: .allowFragments) as? [String: Any]
+                let jsonBody = fromJSONData(data, options: .allowFragments)
                 let errorMessage = "Error calling the remote config API: status: \(httpResponse.statusCode), body: \(String(describing: jsonBody))."
                 hedgeLog(errorMessage)
 
@@ -341,4 +544,33 @@ extension PostHogApi {
         decoder.keyDecodingStrategy = .convertFromSnakeCase
         return decoder
     }()
+}
+
+/// Strips custom headers on redirects that leave the configured host.
+private final class PostHogRedirectHeaderStripper: NSObject, URLSessionTaskDelegate {
+    private let allowedHost: String?
+    private let headerKeys: [String]
+
+    init(allowedHost: String?, headerKeys: [String]) {
+        self.allowedHost = allowedHost
+        self.headerKeys = headerKeys
+    }
+
+    func urlSession(
+        _: URLSession,
+        task _: URLSessionTask,
+        willPerformHTTPRedirection _: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        guard request.url?.host != allowedHost else {
+            completionHandler(request)
+            return
+        }
+        var redirected = request
+        for key in headerKeys {
+            redirected.setValue(nil, forHTTPHeaderField: key)
+        }
+        completionHandler(redirected)
+    }
 }

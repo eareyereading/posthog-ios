@@ -1,5 +1,467 @@
 ## Next
 
+## 3.74.0
+
+### Minor Changes
+
+- 3f9c685: Add `sessionReplayConfig.captureTouches` (default `true`) to disable recording touch coordinates during SDK initialization without disabling screenshots. This protects sensitive screens such as PIN keypads independently of screenshot masking. Runtime changes are not supported.
+
+## 3.73.3
+
+### Patch Changes
+
+- d97cc33: - Preserve inherited session replay masking across siblings inside full-window `ph-no-capture` views.
+  - Keep collecting masks inside clipping views whose model frame reaches zero while their presentation bounds remain visible during an animation.
+
+## 3.73.2
+
+### Patch Changes
+
+- 6e52f5c: - Drop a session replay screenshot when its masked image cannot be rendered, instead of sending the unmasked screenshot.
+  - Collect masks inside a zero-size parent view that does not clip, because it still draws its subviews. React Native's default `overflow: visible` produces such a wrapper.
+  - Collect masks in a view that fades out or fades in, using the opacity the screenshot renders instead of the model `alpha`.
+
+## 3.73.1
+
+### Patch Changes
+
+- 20992b2: Fix layout observation lifecycle races during concurrent subscriptions and preserve safe forwarding for in-flight layout calls when recording stops. Recover layout observation on subscription changes when another swizzler removes or bypasses the PostHog hook.
+
+## 3.73.0
+
+### Minor Changes
+
+- 60267bd: - Preserve bounded durable event, replay, and log queues across retryable upload failures instead of clearing them.
+  - Limit `maxRetries` to push-subscription registration; it no longer bounds event, replay, or log queue flush attempts.
+  - Acknowledge successful and terminal uploads by their exact persisted entry identities so full-queue replacements accepted during an upload are not deleted.
+  - Trim persisted queues to `maxQueueSize` (or `logs.maxBufferSize` for logs) in FIFO order when loading them from disk.
+  - Honor the received HTTP status and `Retry-After` when an upload also returns a transport error: successful and terminal responses remove the sent entries, while retryable responses retain them. A `3xx` left on a failed request is reported as no status, because a redirect does not confirm delivery to the final host.
+  - Preserve existing queued records when writing a new record to a full queue fails.
+  - Retry push-subscription requests that answer with HTTP 408 instead of treating the timeout as terminal, so a pending logout unregister survives until it succeeds.
+
+## 3.72.1
+
+### Patch Changes
+
+- d8c5407: Log a one-time debug warning when the layout observation hook receives an off-main UIKit layout call, without changing the original layout behavior.
+
+## 3.72.0
+
+### Minor Changes
+
+- 8566372: Add `PostHogSDK.prewarmPushNotificationOpenCapture()` so a notification tap delivered before `setup()` is still captured as `$push_notification_opened`.
+
+### Patch Changes
+
+- 8566372: Log a debug warning when `capturePushNotificationOpened` is enabled and no `UNUserNotificationCenter` delegate is set, which is the case where no notification tap can ever be captured.
+
+## 3.71.6
+
+### Patch Changes
+
+- 16c218b: Exclude SDK storage folders from device backups, including existing event, session replay, replay buffer, and log queues.
+- 726d8c8: Capture the latest replay screen state after layouts occur inside the throttle window instead of dropping it.
+
+## 3.71.5
+
+### Patch Changes
+
+- ac5e3a3: Fix automatic screen names for custom view controller containers with a single visible child, excluding offscreen, empty, and fully clipped child views. Use titles for plain UIViewController screens instead of reporting "UI".
+
+## 3.71.4
+
+### Patch Changes
+
+- 430b841: Prevent survey appearance colors with unexpected hex lengths from crashing the SDK.
+
+## 3.71.3
+
+### Patch Changes
+
+- ee9e176: Declare the system boot time and file timestamp APIs used by the SDK in its privacy manifest.
+
+## 3.71.2
+
+### Patch Changes
+
+- 4656dd2: Surveys: show the selected face on emoji rating questions. The selected face took a color that contrasts against `ratingButtonActiveColor`, but the face is tinted rather than drawn on a filled button, so nothing painted that color behind it. PostHog pairs `ratingButtonActiveColor` with an opposing background, so the face blended into the card and disappeared on tap. This affected the default appearance and every built-in theme. The face now takes `ratingButtonActiveColor` directly, which matches the Android SDK.
+
+## 3.71.1
+
+### Patch Changes
+
+- af21b99: Deprecate `POSTHOG_NO_RELEASE_BIND` in the dSYM upload build phase. The script ignores it, prints a warning when it is set, and uploads symbol sets bound to the release it creates, which is what it did before the variable existed. `dsym upload` no longer receives `--no-release-bind`.
+  
+  Event mode only helps when two releases ship a byte-identical binary, because the symbol id is the Mach-O `LC_UUID`. It also cost release attribution for embedded targets: the upload covers every extension dSYM but creates one release, so an extension crash resolved no release once the binding was gone.
+
+## 3.71.0
+
+### Minor Changes
+
+- 27b6b36: Session replay: honor a `ph-no-mask` token on `accessibilityIdentifier` or `accessibilityLabel` to exclude a view (and its subviews) from masking. This gives platforms that cannot reach the `.postHogNoMask()` modifier, such as React Native (where `testID` maps to `accessibilityIdentifier`), a way to selectively unmask known-safe views while keeping `maskAllTextInputs` on.
+
+## 3.70.1
+
+### Patch Changes
+
+- ac3dc31: Fix session replay masks drifting away from the content they cover while a screen scrolls or animates. During fast scrolling, frames are captured with a renderer that keeps masks aligned but draws blur, video and Metal content flat, and that also ignores `layer.mask`, `maskView` and CoreAnimation `filters` — content hidden by those alone is drawn in full in those frames. Use `postHogMask()` for anything that must never appear in a recording.
+
+## 3.70.0
+
+### Minor Changes
+
+- b67d001: Surveys can now display an optional intro screen before the first question, configured via the new `displayIntroScreen`, `introScreenHeader`, `introScreenDescription`, `introScreenDescriptionContentType`, and `introScreenButtonText` appearance fields (mirroring the existing thank-you message fields, including translations). Advancing past the intro records no response and sends no survey event; dismissing the survey from the intro still sends the normal `survey dismissed` event. The new fields are also exposed on `PostHogDisplaySurveyAppearance` for custom survey delegates. Additionally fixes the thank-you message description never rendering in the built-in survey UI.
+
+## 3.69.12
+
+### Patch Changes
+
+- 2c034db: Use posthog-cli 0.15.1 and newer to read release metadata directly from the app Info.plist when uploading debug symbols.
+
+## 3.69.11
+
+### Patch Changes
+
+- a8175f1: Fix a fatal SIGPIPE when session replay console log capture is torn down, for example when the app backgrounds with `sessionReplayConfig.captureLogs` enabled. Teardown closed the descriptors the pipe readers were still writing to, which could kill the process.
+
+## 3.69.10
+
+### Patch Changes
+
+- b2d09aa: Upload symbols under the app version reported by Info.plist, including custom build settings. Wait for the current dSYM and fail after a configurable timeout instead of uploading invalid symbols.
+
+## 3.69.9
+
+### Patch Changes
+
+- 275505d: Mask React Native New Architecture (Fabric) text and image component views (RCTParagraphComponentView, RCTImageComponentView) and react-native-svg root views (RNSVGSvgView) during session replay, matching the existing legacy RCTTextView/RCTImageView handling.
+- 7285d17: Fix `reloadFeatureFlags(_:)` completion handlers resolving with stale cached flags when a reload was displaced from the pending queue. They now resolve against a `/flags` response that actually went out, so they fire later — after a round trip and any retries — but with flags evaluated for the caller's request-time person properties.
+- 856667f: Drop events and logs when Objective-C beforeSend callbacks raise exceptions.
+
+## 3.69.8
+
+### Patch Changes
+
+- 35f27d3: Skip push token registration when the project has no push integration for the app_id, using the `push.appIds` list published in remote config. A device whose project configures push later re-registers on the next config load rather than staying unreachable.
+
+## 3.69.7
+
+### Patch Changes
+
+- 6f44883: Fix APNs registration callbacks being swallowed in SwiftUI apps that use `@UIApplicationDelegateAdaptor` (#768).
+
+## 3.69.6
+
+### Patch Changes
+
+- 001ced2: Document and verify that custom event timestamps are serialized as equivalent UTC instants.
+- aca4f86: Refresh survey definitions when a new remote config loads.
+
+## 3.69.5
+
+### Patch Changes
+
+- a164d38: Fix: opting back in now re-arms push notifications without an app restart. After a logout unregister clears the device token, `optIn()` re-requests the APNs token and re-registers the device (when `capturePushNotificationSubscriptions` is enabled) instead of only restoring consent (#746).
+
+## 3.69.4
+
+### Patch Changes
+
+- ad199d2: Fix: opting out no longer strands an in-flight push unregister. A `DELETE /push_subscriptions` is data removal, so it now goes out even after `optOut()` instead of leaving the server-side subscription active for the whole opted-out period (#746).
+
+## 3.69.3
+
+### Patch Changes
+
+- 057f4d6: Fix push notification open forwarding for Objective-C delegates.
+
+## 3.69.2
+
+### Patch Changes
+
+- 6623953: Fix CocoaPods static-library builds on older Xcode versions by disabling emitted module interface verification with the Swift compiler flag.
+
+## 3.69.1
+
+### Patch Changes
+
+- 9a7f442: Fix CocoaPods static-library archives by skipping emitted module interface verification for source pod builds.
+
+## 3.69.0
+
+### Minor Changes
+
+- c37aea6: Add push notification support for PostHog Workflows. The SDK now registers the device's APNs token (iOS) so Workflows can deliver push notifications, and captures a `$push_notification_opened` event when a notification is tapped. Both are on by default and can be turned off with the new `capturePushNotificationSubscriptions` and `capturePushNotificationOpened` config flags. For setups that don't use swizzling, use `registerPushNotificationToken(_:appId:)` and `capturePushNotificationOpened(response:)` to feed these manually, or `capturePushNotificationOpened(title:subtitle:body:payload:action:)` when no `UNNotificationResponse` is available. On `reset()` the token is unregistered for the logged-out user and re-registered under the new anonymous id, and `unregisterPushNotificationToken()` lets you unregister manually.
+
+- fix: `identify()` no longer leaves a user anonymous when the supplied ID already matches the persisted distinct ID (for example after a non-identified bootstrap seeded the same ID); the SDK now marks the user identified and captures a person-processed `$set` event. The identity transition is now atomic, so concurrent `identify()` calls can no longer emit duplicate person events for the same transition
+
+## 3.68.4
+
+### Patch Changes
+
+- 21151d8: Use Swift 6 access-controlled imports for vendored implementation modules and enable library evolution for framework builds, removing implementation-only import warnings without exposing private module dependencies to SDK consumers.
+
+## 3.68.3
+
+### Patch Changes
+
+- 910b82c: Fix `postHogMask()` causing severe launch and scroll hangs on iOS 26 in lazy SwiftUI containers (`ScrollView` + `LazyVStack`). The modifier now reports its region through a single passive overlay view whose frame is read live at snapshot time, replacing the per-mask tag-view traversal and KVO ancestor observers that degenerated to O(N²) work on the shared hosting view. Behavior notes: a masked view is now redacted across its full extent (previously only its resolved backing subviews), and screenshot snapshots are skipped while a masked view awaits its first layout, so a frame can never be captured under-masked. Also fixes overlapping masks unmasking each other's targets on teardown, flag claims outliving their owner view, and bounds the iOS 26 layer scan to the masked view's own extent.
+
+## 3.68.2
+
+### Patch Changes
+
+- 71cf6c5: Fix rage click detection dismissing presented UI (e.g. popovers and sheets) on the opening tap. The hit-test fallback used to recover a tapped view now runs as a stateless query (`hitTest` with `nil`) instead of re-entering UIKit's hit-testing/gesture machinery with the in-flight event, which corrupted internal touch/gesture state.
+
+## 3.68.1
+
+### Patch Changes
+
+- 6a1f49d: Fix error tracking autocapture never installing on a first launch that has no cached remote config. The crash reporter now installs by default before the first `/config` response arrives, so crashes on the very first launch are captured. If the response then reports `autocaptureExceptions: false`, the integration is uninstalled and removed.
+
+## 3.68.0
+
+### Minor Changes
+
+- f29934c: Surveys now re-translate in place while displayed. When the user's `language` person property changes (via `identify`/`setPersonProperties`) and a matching translation exists, the on-screen survey updates to the new language without restarting, preserving the current question and progress. Custom survey delegates can adopt the new optional `updateSurvey(_:)` to support live updates.
+
+## 3.67.1
+
+### Patch Changes
+
+- 4c8c5a4: Fix surveys scoped to web via a CSS selector or URL display condition leaking onto native iOS. Surveys carrying `conditions.selector` or `conditions.url` are now treated as non-matching on native platforms, since those conditions can only be evaluated in a web context.
+
+## 3.67.0
+
+### Minor Changes
+
+- 262c9b2: Send minimal `$feature_flag_called` events when the server opts the project in (top-level `minimalFlagCalledEvents` in the flags response) and the evaluated flag has no experiment. Minimal events keep only a strict allowlist of flag-evaluation and linkage properties plus `$os_name`, `$os_version`, and `$app_version` for OS- and version-segmented insights; the rest of the device/OS context envelope, super properties, `$active_feature_flags`, and the `$feature/<key>` enumeration are stripped. Experiment-linked flags, ungated projects, and any response missing the signals keep sending the full event.
+
+## 3.66.1
+
+### Patch Changes
+
+- a582c6a: Add a `$feature_flag_has_experiment` boolean property to `$feature_flag_called` events, sourced from the flag's `metadata.has_experiment` in the flags response. The property is only sent when the server explicitly reports it and omitted when unknown (e.g. legacy responses without flag details).
+
+## 3.66.0
+
+### Minor Changes
+
+- 474eb4a: Add a `bootstrap` option to `PostHogConfig` for pre-seeding identity and feature flags before the first `/flags` response. Set `config.bootstrap = PostHogBootstrapConfig(...)` before `setup()` so early events carry a caller-controlled distinct ID and flag reads return your values during cold start. Mirrors the `bootstrap` option in posthog-js.
+
+## 3.65.0
+
+### Minor Changes
+
+- 2ee22f5: Add `PostHogSDK.captureSessionReplaySnapshot(afterScreenUpdates:)`, an SPI session-replay hook (`@_spi(PostHogInternal)`) that lets first-party PostHog wrapper SDKs (e.g. posthog-flutter) capture the current native window on their own cadence — used to record native screens that cover an out-of-engine UI. Not a public API: it requires an `@_spi(PostHogInternal) import` and carries no stability guarantees.
+
+## 3.64.7
+
+### Patch Changes
+
+- 2f1e1c3: `upload-symbols.sh` supports `POSTHOG_SKIP_ON_CONFLICT=1` to pass `--skip-on-conflict` to `posthog-cli dsym upload`, so dSYM content conflicts skip the upload instead of failing the build (requires posthog-cli >= 0.7.12)
+
+## 3.64.6
+
+### Patch Changes
+
+- 6ba42c4: Fix `errorTrackingConfig.ignoredExceptionTypes` not being applied to `$exception` events sent through the generic `capture()` API (e.g. hybrid SDK bridges forwarding pre-serialized exceptions); previously only `captureException` and crash-report autocapture honored it.
+
+## 3.64.5
+
+### Patch Changes
+
+- 3921285: fix: make vendored protobuf-c header resolution robust against header-search-path loss
+
+  Relocate the vendored `protobuf-c.{h,c}` next to `PLCrashReport.pb-c.h`, the only
+  source that includes `protobuf-c.h` across directories, so the include resolves via
+  the compiler's same-directory rule instead of a `HEADER_SEARCH_PATHS` entry. This
+  prevents intermittent `'protobuf-c.h' file not found` build failures when a
+  consumer's build drops the pod's header search paths.
+
+## 3.64.4
+
+### Patch Changes
+
+- c5b2d23: Avoid a crash in the flags and remote-config API handlers when the URL response is not an `HTTPURLResponse` (previously force-cast); the SDK now logs and returns gracefully instead.
+- 24cbc60: Session replay (screenshot mode): skip re-sending unchanged screenshots. Static screens no longer upload an identical full screenshot every tick, cutting replay bandwidth and storage. Wireframe mode is unaffected.
+
+## 3.64.3
+
+> **Note:** Version 3.64.3 is available through Swift Package Manager only. CocoaPods users should use **3.64.4** or later.
+
+### Patch Changes
+
+- 5ed8fd6: Fix event-queue peek/pop misalignment that could re-send already-delivered events when a file was skipped, and stop deleting valid queue files that are only temporarily unreadable (e.g. iOS data protection on a locked device).
+
+## 3.64.2
+
+### Patch Changes
+
+- 6a5b391: fix: prevent Session Replay crashes on AVAggregateAssetDownloadTask
+
+## 3.64.1
+
+### Patch Changes
+
+- ced6a8b: Fix the upload symbols script for projects with spaces in their paths.
+
+## 3.64.0
+
+### Minor Changes
+
+- b9afc8f: Add `ignoredExceptionTypes` to `PostHogErrorTrackingConfig` so apps embedding both the JS RN SDK and the native iOS SDK can suppress duplicate native captures by exception class name.
+
+### Patch Changes
+
+- 7dbeb82: Retry remote feature flag requests after transient 502 and 504 responses.
+
+## 3.63.1
+
+### Patch Changes
+
+- b9126c7: Feature-flag properties (`$feature/*` and `$active_feature_flags`) passed explicitly to `capture()` now take precedence over the SDK's cached flag values, matching posthog-js (web) and posthog-android.
+
+## 3.63.0
+
+### Minor Changes
+
+- 5fa4a56: Add `requestHeaders` config option to send custom headers (e.g. `Authorization`) with every request to the PostHog API. Useful for reverse-proxy setups that require authentication.
+
+## 3.62.5
+
+### Patch Changes
+
+- e57e428: Session replay now respects the resolved recording config once the first remote config response arrives. Recording still starts optimistically from the disk-cached config at cold start, but snapshots are now buffered (not persisted) until the first live remote config resolves. On resolve, the buffered opening window is flushed to the replay queue only when the session is recordable under the fresh config — recording flag on, sampled in, and not waiting on an event trigger — and is dropped otherwise, so a returning user no longer uploads a stale-cache window the fresh config disallows via the recording flag, sample rate, or event trigger. When recording is gated on a linked feature flag — whose value is only fresh once the flags response (which follows the config response) arrives — resolution is deferred to that flags reload so the window isn't flushed on a stale flag value; if feature-flag preloading is disabled, so no flags reload follows, it resolves against the cached flag instead. A subsequent remote config that turns recording off also stops it promptly instead of waiting for the next session rotation.
+
+## 3.62.4
+
+### Patch Changes
+
+- b9bf252: Retry capture delivery on transient HTTP errors and respect Retry-After responses while preserving queued events across retries.
+
+## 3.62.3
+
+### Patch Changes
+
+- c5f5b60: Generate lowercase UUID strings for SDK-created event, anonymous, session, and queue identifiers.
+
+## 3.62.2
+
+### Patch Changes
+
+- fb59e77: Fall back to uncompressed uploads when local gzip compression fails.
+
+## 3.62.1
+
+### Patch Changes
+
+- c1a7f11: Retry feature flag requests after transient network errors only. The feature flag request retry count defaults to 1 and can be set to 0 to disable retries.
+
+## 3.62.0
+
+### Minor Changes
+
+- fcc876e: Add `PostHogSDK.getAllFeatureFlags()` returning all loaded flags as `[PostHogFeatureFlagResult]` (key, enabled, variant, payload). Exposed to Objective-C via `@objc`.
+
+## 3.61.1
+
+### Patch Changes
+
+- b5bdba8: Session replay: skip native event-trigger gating when running under React Native (`postHogSdkName == "posthog-react-native"`). React Native evaluates `sessionRecording.eventTriggers` in its JS layer and drives recording via explicit `startSessionRecording` calls; the native gate could never be satisfied because JS-captured events never reach the native capture pipeline, so event-triggered replay never recorded on RN. The linked-flag and sampling gates are unchanged, and non-RN behavior is unaffected.
+
+## 3.61.0
+
+### Minor Changes
+
+- 1f5d88d: Add `addExceptionStep(_:properties:)` to record breadcrumb-style steps that attach to every captured `$exception` as `$exception_steps`.
+
+## 3.60.1
+
+### Patch Changes
+
+- 805c834: Respect remote session replay sample rates after config loads.
+
+## 3.60.0
+
+### Minor Changes
+
+- b9861d8: Rage click detection no longer emits `$rageclick` on controls where rapid repeated taps are intentional rather than frustration — the on-screen keyboard, text fields and text selection, steppers, sliders, pickers, date pickers, segmented controls and page controls. This applies to UIKit and SwiftUI. You can exclude a custom control with the `ph-no-rageclick` accessibility identifier/label (UIKit) or the `.postHogNoRageClick()` view modifier (SwiftUI).
+
+## 3.59.3
+
+### Patch Changes
+
+- 6b6dd54: `reloadFeatureFlags(_:)` now always invokes its completion callback, including when the SDK is disabled/opted-out or when no remote config is available. Previously these early-returns skipped the callback, which could leave callers that await it (e.g. the Flutter SDK's `reloadFeatureFlags`) hanging indefinitely.
+- 306896b: Keep session replay recording, error-tracking autocapture, and network performance capture active after an in-session `identify()`/`reset()` instead of disabling them until the next app restart. The project-level recording, error-tracking, and capture-performance config is now preserved across `reset()` and re-armed on the next `/flags` reload.
+
+## 3.59.2
+
+### Patch Changes
+
+- 0cc8d80: Retry event uploads on HTTP 408 (Request Timeout), matching the SDK's existing logs-endpoint behavior.
+
+## 3.59.1
+
+### Patch Changes
+
+- 2afa9ec: fix(surveys): a single malformed survey no longer disables every survey on iOS. Surveys are now decoded per-element (a bad entry is logged and skipped instead of dropping the whole list), and rating questions tolerate missing `lowerBoundLabel`/`upperBoundLabel` to match Web/Android behavior. Empty bound labels are also no longer rendered as blank caption rows under the rating control. Fixes #611.
+
+## 3.59.0
+
+### Minor Changes
+
+- c0341fe: Auto-attach `$screen_name` to every captured event after `PostHogSDK.shared.screen()` has been called (manually or via screen-view auto-capture). Cached value is cleared by `reset()` and `close()`.
+
+  **To opt out of `$screen_name` stamping entirely**, set `PostHogConfig.captureScreenViews = false` **and** stop calling `screen()` manually. Disabling `captureScreenViews` alone is not sufficient — a single manual `screen("Home")` call will re-enable stamping.
+
+### Minor Changes
+
+- Add survey translations support. Surveys can carry per-language overrides for user-visible strings via a `translations` map keyed by language code. At display time the SDK resolves a language (`PostHogSurveysConfig.overrideDisplayLanguage` → person property `"language"` → device locale), applies any matching translation onto the display model, and stamps the matched key as `$survey_language` on every survey event when a translation actually took effect. Matching is case-insensitive with a base-language fallback (e.g. `"pt-BR"` falls back to `"pt"`).
+
+## 3.58.3
+
+### Patch Changes
+
+- 90ceeea: fix: silence PHPLCrashReporter CocoaPods module warnings
+
+## 3.58.2
+
+### Patch Changes
+
+- ce2c65a: fix: silence vendored libwebp macro redefinition warning
+
+## 3.58.1
+
+### Patch Changes
+
+- f91bb4e: Add an experimental `sessionReplayConfig.screenshotModeBackgroundCapture` option for Session Replay screenshot mode, allowing screenshot rendering to be scheduled on a background queue to reduce main-thread pressure.
+
+## 3.58.0
+
+### Minor Changes
+
+- 7e9bf5f: Add a logs feature for shipping structured log records from iOS, macOS, tvOS, watchOS, and visionOS apps:
+
+  ```swift
+  PostHogSDK.shared.captureLog("hello", level: .info, attributes: ["k": "v"])
+  PostHogSDK.shared.logger?.info("ready")
+  PostHogSDK.shared.flush()
+  ```
+
+  Configure batching, rate limiting, service metadata, and a `beforeSend` filter via `config.logs`. Records are persisted to disk and survive app restarts. Manual capture only — console autocapture is not included.
+
+### Patch Changes
+
+- 78bb5e8: fix: synchronize SDK enabled state
+- 85afba6: Keep the SDK disabled when no project token or API key is provided.
+
+## 3.57.6
+
+### Patch Changes
+
+- 2e76fa6: fix: duplicate symbol linker errors when posthog-ios is used alongside other dependencies that also include libwebp, such as SDWebImageWebPCoder or KingfisherWebP
+
 ## 3.57.5
 
 ### Patch Changes
@@ -135,6 +597,8 @@
 - 3545320: fix: guard swizzled layoutSublayers to handle background thread calls
 - 061cb44: Replace ReadWriteLock with NSLock for consistent thread-safety across the codebase. The ReadWriteLock property wrapper provided false thread-safety for collection types since the lock was released between separate operations. Using explicit NSLock with `.withLock` closures ensures atomic operations and clearer intent.
 - ac76d70: fix: clear in-memory feature flags cache on reset()
+
+> ⚠️ WARNING: This release contains a crash bug ([#537](https://github.com/PostHog/posthog-ios/issues/537)) fixed in **3.48.3**. Avoid pinning to this version especially in workflows where you may be downgrading between SDK versions (e.g. TestFlight distributions) and use **3.48.3** or later instead.
 
 ## 3.48.0
 
@@ -757,12 +1221,12 @@ No immediate action required - existing code using `evaluationEnvironments` will
 
 Check out the updated [docs](https://posthog.com/docs/libraries/ios).
 
-Check out the [USAGE](https://github.com/PostHog/posthog-ios/blob/main/USAGE.md) guide.
+Check out the [docs](https://posthog.com/docs/libraries/ios/usage) guide.
 
 ### Changes
 
 - Rewritten in Swift.
-- [Breaking changes](https://github.com/PostHog/posthog-ios/blob/main/USAGE.md#breaking-changes) in the API.
+- [Breaking changes](https://github.com/PostHog/posthog-ios/blob/3.0.0/USAGE.md#breaking-changes) in the API.
 
 ## 3.0.0-RC.1 - 2024-01-16
 
@@ -876,7 +1340,7 @@ Completely remove reference to the AdSupport framework
 
 Shift responsibility of IDFA collection to clients ([#5](https://github.com/PostHog/posthog-ios/pull/5))
 by removing any references to Apple's AdSupport framework from the library. In case you need to
-use the $device_advertisingId field, [see here](https://posthog.com/docs/integrations/ios-integration) for how to enable it.
+use the $device_advertisingId field, [see here](https://posthog.com/docs/libraries/ios) for how to enable it.
 
 ## 1.0.5 - 2020-08-25
 

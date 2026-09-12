@@ -19,7 +19,28 @@ enum PostHogIntegrationInstallResult: Equatable {
     case skipped(PostHogIntegrationInstallSkipReason)
 }
 
-protocol PostHogIntegration {
+final class PostHogIntegrationInstallState {
+    private let lock = NSLock()
+    private var installed = false
+
+    func markInstalled() -> Bool {
+        lock.withLock {
+            if installed {
+                return false
+            }
+            installed = true
+            return true
+        }
+    }
+
+    func clear() {
+        lock.withLock {
+            installed = false
+        }
+    }
+}
+
+protocol PostHogIntegration: AnyObject {
     /**
      * Indicates whether this integration requires method swizzling to function.
      *
@@ -69,21 +90,32 @@ protocol PostHogIntegration {
      * while maintaining its installation status (e.g manual start/stop for session recording)
      */
     func stop()
-
-    /**
-     * Called when the event context changes (e.g., after identify, reset, group, register).
-     *
-     * Integrations can use this to react to context changes. For example, the crash reporting
-     * integration persists this context to disk for crash-time capture.
-     *
-     * - Parameter context: The current event context dictionary containing static context,
-     *   dynamic context, identity info (distinct_id, groups), session_id, and registered properties.
-     */
-    func contextDidChange(_ context: [String: Any])
 }
 
 extension PostHogIntegration {
-    func contextDidChange(_: [String: Any]) {
-        // Default empty implementation since most integrations won't need this
+    func installIfNeeded(
+        using state: PostHogIntegrationInstallState,
+        _ install: () -> Void
+    ) -> PostHogIntegrationInstallResult {
+        guard state.markInstalled() else {
+            return .skipped(.alreadyInstalled)
+        }
+
+        install()
+        return .installed
+    }
+
+    func uninstallIfNeeded(
+        from postHog: PostHogSDK,
+        installedPostHog: PostHogSDK?,
+        state: PostHogIntegrationInstallState,
+        _ uninstall: () -> Void
+    ) {
+        guard installedPostHog === postHog || installedPostHog == nil else {
+            return
+        }
+
+        uninstall()
+        state.clear()
     }
 }

@@ -114,6 +114,9 @@ class PostHogSamplingTests {
             server.start()
             let storage = PostHogStorage(config)
             storage.reset()
+            // reset() keeps .remoteConfig (project-level config); clear it so shared on-disk storage
+            // doesn't leak recording config between these serialized tests.
+            storage.remove(key: .remoteConfig)
         }
 
         deinit {
@@ -142,7 +145,7 @@ class PostHogSamplingTests {
             let storage = PostHogStorage(config)
             defer { storage.reset() }
 
-            storage.setDictionary(forKey: .sessionReplay, contents: ["sampleRate": "0.75"])
+            storage.setDictionary(forKey: .remoteConfig, contents: ["sessionRecording": ["sampleRate": "0.75"]])
 
             let sut = getSut(storage: storage)
 
@@ -154,7 +157,7 @@ class PostHogSamplingTests {
             let storage = PostHogStorage(config)
             defer { storage.reset() }
 
-            storage.setDictionary(forKey: .sessionReplay, contents: ["sampleRate": 0.5])
+            storage.setDictionary(forKey: .remoteConfig, contents: ["sessionRecording": ["sampleRate": 0.5]])
 
             let sut = getSut(storage: storage)
 
@@ -166,7 +169,7 @@ class PostHogSamplingTests {
             let storage = PostHogStorage(config)
             defer { storage.reset() }
 
-            storage.setDictionary(forKey: .sessionReplay, contents: ["sampleRate": "1"])
+            storage.setDictionary(forKey: .remoteConfig, contents: ["sessionRecording": ["sampleRate": "1"]])
 
             let sut = getSut(storage: storage)
 
@@ -178,7 +181,7 @@ class PostHogSamplingTests {
             let storage = PostHogStorage(config)
             defer { storage.reset() }
 
-            storage.setDictionary(forKey: .sessionReplay, contents: ["sampleRate": "0"])
+            storage.setDictionary(forKey: .remoteConfig, contents: ["sessionRecording": ["sampleRate": "0"]])
 
             let sut = getSut(storage: storage)
 
@@ -190,7 +193,7 @@ class PostHogSamplingTests {
             let storage = PostHogStorage(config)
             defer { storage.reset() }
 
-            storage.setDictionary(forKey: .sessionReplay, contents: ["sampleRate": "1.5"])
+            storage.setDictionary(forKey: .remoteConfig, contents: ["sessionRecording": ["sampleRate": "1.5"]])
 
             let sut = getSut(storage: storage)
 
@@ -202,7 +205,7 @@ class PostHogSamplingTests {
             let storage = PostHogStorage(config)
             defer { storage.reset() }
 
-            storage.setDictionary(forKey: .sessionReplay, contents: ["sampleRate": "-0.5"])
+            storage.setDictionary(forKey: .remoteConfig, contents: ["sessionRecording": ["sampleRate": "-0.5"]])
 
             let sut = getSut(storage: storage)
 
@@ -214,7 +217,7 @@ class PostHogSamplingTests {
             let storage = PostHogStorage(config)
             defer { storage.reset() }
 
-            storage.setDictionary(forKey: .sessionReplay, contents: ["sampleRate": "invalid"])
+            storage.setDictionary(forKey: .remoteConfig, contents: ["sessionRecording": ["sampleRate": "invalid"]])
 
             let sut = getSut(storage: storage)
 
@@ -233,16 +236,12 @@ class PostHogSamplingTests {
 
             let sut = getSut(config: config)
 
-            var remoteConfigLoaded = false
+            let remoteConfigLoaded = AsyncLatch()
             let token = sut.onRemoteConfigLoaded.subscribe { _ in
-                remoteConfigLoaded = true
+                remoteConfigLoaded.signal()
             }
 
-            await withCheckedContinuation { continuation in
-                let timeout = Date().addingTimeInterval(2)
-                while !remoteConfigLoaded, Date() < timeout {}
-                continuation.resume()
-            }
+            await remoteConfigLoaded.wait()
 
             #expect(sut.getRecordingSampleRate() == 0.5)
             _ = token
@@ -260,19 +259,66 @@ class PostHogSamplingTests {
 
             let sut = getSut(config: config)
 
-            var remoteConfigLoaded = false
+            let remoteConfigLoaded = AsyncLatch()
             let token = sut.onRemoteConfigLoaded.subscribe { _ in
-                remoteConfigLoaded = true
+                remoteConfigLoaded.signal()
             }
 
-            await withCheckedContinuation { continuation in
-                let timeout = Date().addingTimeInterval(2)
-                while !remoteConfigLoaded, Date() < timeout {}
-                continuation.resume()
-            }
+            await remoteConfigLoaded.wait()
 
             #expect(sut.getRecordingSampleRate() == nil)
             _ = token
+        }
+    }
+
+    // MARK: - Replay integration remote sample rate Tests
+
+    @Suite("Replay integration remote sample rate Tests", .serialized)
+    class ReplayIntegrationRemoteSampleRateTests {
+        let server: MockPostHogServer
+
+        init() {
+            server = MockPostHogServer()
+            server.start()
+            PostHogReplayIntegration.clearInstalls()
+        }
+
+        deinit {
+            server.stop()
+            PostHogReplayIntegration.clearInstalls()
+        }
+
+        @Test("remote sample rate is applied after config loads")
+        func remoteSampleRateIsAppliedAfterConfigLoads() async {
+            let config = PostHogConfig(projectToken: "remote_sample_rate_test", host: "http://localhost:9001")
+            config.sessionReplay = true
+            config.preloadFeatureFlags = false
+            config.disableReachabilityForTesting = true
+            config.disableQueueTimerForTesting = true
+            config.disableFlushOnBackgroundForTesting = true
+            config.storageManager = PostHogStorageManager(config)
+
+            let storage = PostHogStorage(config)
+            storage.reset()
+            storage.remove(key: .remoteConfig)
+
+            server.returnReplay = true
+            server.sessionRecordingSampleRate = "0"
+
+            let sut = PostHogSDK.with(config)
+            defer { sut.close() }
+
+            await waitUntil {
+                sut.remoteConfig?.getRecordingSampleRate() == 0.0
+            }
+
+            await waitUntil {
+                sut.getReplayIntegration()?.isActive() == false
+            }
+
+            #expect(sut.remoteConfig?.getRecordingSampleRate() == 0.0)
+            #expect(sut.getReplayIntegration()?.isActive() == false)
+            #expect(sut.isSessionReplayActive() == false)
         }
     }
 

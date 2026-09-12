@@ -42,7 +42,7 @@
                     }
                 }
 
-                if scale != .twoPoint {
+                if scale != .twoPoint, !lowerBoundLabel.isEmpty || !upperBoundLabel.isEmpty {
                     HStack(spacing: 0) {
                         Text(lowerBoundLabel)
                             .foregroundStyle(appearance.descriptionTextColor)
@@ -86,11 +86,8 @@
         }
 
         private func foregroundColor(selected: Bool) -> Color {
-            if selected {
-                return ratingButtonActiveColor.getContrastingTextColor()
-            } else {
-                return inputTextColor.opacity(0.5)
-            }
+            // The glyph is tinted, not drawn on a filled button, so the active color is the glyph color.
+            selected ? ratingButtonActiveColor : inputTextColor.opacity(0.5)
         }
 
         private var ratingButtonActiveColor: Color {
