@@ -16,8 +16,7 @@
     class PostHogReplayIntegration: PostHogIntegration {
         var requiresSwizzling: Bool { true }
 
-        private static var integrationInstalledLock = NSLock()
-        private static var integrationInstalled = false
+        private static let integrationInstallState = PostHogIntegrationInstallState()
 
         private var config: PostHogConfig? {
             postHog?.config
@@ -36,9 +35,13 @@
         private var applicationForegroundedToken: RegistrationToken?
         private var viewLayoutToken: RegistrationToken?
         private var remoteConfigLoadedToken: RegistrationToken?
+        private var featureFlagsLoadedToken: RegistrationToken?
         private var sessionIdChangedToken: RegistrationToken?
         private var eventCapturedToken: RegistrationToken?
         private var installedPlugins: [PostHogSessionReplayPlugin] = []
+
+        private let screenshotRenderLock = NSLock()
+        private var isScreenshotRenderInFlight = false
 
         private let eventTriggersLock = NSLock()
         private var eventTriggers: [String]?
@@ -47,8 +50,17 @@
         // Minimum duration buffering state
         private let bufferingLock = NSLock()
         private var hasPassedMinimumDuration: Bool = false
-        private var minimumDurationSessionId: String?
         private var cachedMinimumDuration: TimeInterval?
+
+        // First-remote-config buffering state. While the first live `/config` is still pending,
+        // snapshots are buffered (not persisted) so a stale cached flag can't record a window the
+        // fresh config disallows. All reads/writes are guarded by `bufferingLock`.
+        private var awaitingFirstRemoteConfig: Bool = false
+        // Latched true once a `/config` attempt has been observed as complete: immediately when one
+        // succeeds (via `applyRemoteConfig`), or on the next flags reload that sees `hasFetchedRemoteConfig`
+        // after a failed attempt. Lets a buffer still awaiting after a failed first `/config` resolve from
+        // a later flags reload.
+        private var didResolveRemoteConfig: Bool = false
 
         /**
          ### Mapping of SwiftUI Views to UIKit (up until iOS 18)
@@ -124,6 +136,14 @@
 
         private let reactNativeTextView: AnyClass? = NSClassFromString("RCTTextView")
         private let reactNativeImageView: AnyClass? = NSClassFromString("RCTImageView")
+        // React Native New Architecture (Fabric) renders text and images with these component views
+        // instead of RCTTextView/RCTImageView; react-native-svg draws its node hierarchy into RNSVGSvgView
+        private let reactNativeParagraphView: AnyClass? = NSClassFromString("RCTParagraphComponentView")
+        private let reactNativeImageComponentView: AnyClass? = NSClassFromString("RCTImageComponentView")
+        private let reactNativeSvgView: AnyClass? = NSClassFromString("RNSVGSvgView")
+        private let reactNativeSvgRenderableView: AnyClass? = NSClassFromString("RNSVGRenderable")
+        private let reactNativeSvgGroupView: AnyClass? = NSClassFromString("RNSVGGroup")
+        private let reactNativeSvgTextView: AnyClass? = NSClassFromString("RNSVGText")
         // These are usually views that don't belong to the current process and are most likely sensitive
         private let systemSandboxedView: AnyClass? = NSClassFromString("_UIRemoteView")
 
@@ -141,55 +161,58 @@
             postHogSdkName != "posthog-flutter"
         }
 
+        private func isNotReactNative() -> Bool {
+            // for the React Native SDK, event-trigger evaluation is owned by the JS layer
+            postHogSdkName != "posthog-react-native"
+        }
+
         func install(_ postHog: PostHogSDK) -> PostHogIntegrationInstallResult {
-            let didInstall = PostHogReplayIntegration.integrationInstalledLock.withLock {
-                if PostHogReplayIntegration.integrationInstalled {
-                    return false
+            installIfNeeded(using: Self.integrationInstallState) {
+                self.postHog = postHog
+                replayQueue = postHog.replayQueue
+
+                // Wire up as buffer delegate for the replay queue
+                replayQueue?.bufferDelegate = self
+
+                // Resolve event triggers and minimum duration from cached remote config (if available)
+                if let cachedRemoteConfig = postHog.remoteConfig?.getRemoteConfig() {
+                    updateEventTriggers(from: cachedRemoteConfig)
                 }
-                PostHogReplayIntegration.integrationInstalled = true
-                return true
+                updateCachedMinimumDuration()
+
+                // Buffer snapshots until the first live remote config resolves (unless it already has),
+                // so a stale cached flag can't leak a recording the fresh config disallows.
+                let awaiting = shouldAwaitFirstRemoteConfig()
+                bufferingLock.withLock { awaitingFirstRemoteConfig = awaiting }
+
+                // Subscribe to remote config changes (needed before start to update triggers)
+                remoteConfigLoadedToken = postHog.remoteConfig?.onRemoteConfigLoaded.subscribe { [weak self] config in
+                    self?.applyRemoteConfig(remoteConfig: config)
+                }
+
+                // Subscribe to feature flag reloads so the buffer also resolves after reset()/identity
+                // changes, which reload flags but not `/config` (the only path that fires applyRemoteConfig).
+                featureFlagsLoadedToken = postHog.remoteConfig?.onFeatureFlagsLoaded.subscribe { [weak self] _ in
+                    self?.resolveBufferFromFeatureFlags()
+                }
+
+                // Subscribe to event captures for trigger matching (needed before start to detect triggers)
+                eventCapturedToken = postHog.onEventCaptured.subscribe { [weak self] event in
+                    self?.handleEventCaptured(event: event.event)
+                }
+
+                start()
             }
-
-            guard didInstall else {
-                return .skipped(.alreadyInstalled)
-            }
-
-            self.postHog = postHog
-            replayQueue = postHog.replayQueue
-
-            // Wire up as buffer delegate for the replay queue
-            replayQueue?.bufferDelegate = self
-
-            // Resolve event triggers and minimum duration from cached remote config (if available)
-            if let cachedRemoteConfig = postHog.remoteConfig?.getRemoteConfig() {
-                updateEventTriggers(from: cachedRemoteConfig)
-            }
-            updateCachedMinimumDuration()
-
-            // Subscribe to remote config changes (needed before start to update triggers)
-            remoteConfigLoadedToken = postHog.remoteConfig?.onRemoteConfigLoaded.subscribe { [weak self] config in
-                self?.applyRemoteConfig(remoteConfig: config)
-            }
-
-            // Subscribe to event captures for trigger matching (needed before start to detect triggers)
-            eventCapturedToken = postHog.onEventCaptured.subscribe { [weak self] event in
-                self?.handleEventCaptured(event: event.event)
-            }
-
-            start()
-            return .installed
         }
 
         func uninstall(_ postHog: PostHogSDK) {
-            if self.postHog === postHog || self.postHog == nil {
+            uninstallIfNeeded(from: postHog, installedPostHog: self.postHog, state: Self.integrationInstallState) {
                 stop()
                 // Clear the pre-start listeners
                 remoteConfigLoadedToken = nil
+                featureFlagsLoadedToken = nil
                 eventCapturedToken = nil
                 self.postHog = nil
-                PostHogReplayIntegration.integrationInstalledLock.withLock {
-                    PostHogReplayIntegration.integrationInstalled = false
-                }
 
                 // Clear buffer delegate
                 replayQueue?.bufferDelegate = nil
@@ -249,7 +272,7 @@
             // flutter captures snapshots, so we don't need to capture them here
             if isNotFlutter() {
                 let interval = postHog.config.sessionReplayConfig.throttleDelay
-                viewLayoutToken = DI.main.viewLayoutPublisher.onViewLayout.subscribe(throttle: interval) { [weak self] in
+                viewLayoutToken = DI.main.viewLayoutPublisher.onViewLayout.subscribe(throttle: interval, trailing: true) { [weak self] in
                     // called on main thread
                     self?.snapshot()
                 }
@@ -261,7 +284,8 @@
                 self?.handleApplicationEvent(event: event, date: date)
             }
 
-            // Install plugins
+            // Install plugins. The full remote config survives reset() (project-level), so plugin
+            // enablement re-arms when the integration restarts after an identity change.
             let pluginTypes = postHog.config.sessionReplayConfig.getPluginTypes()
             let remoteConfig = postHog.remoteConfig?.getRemoteConfig()
             let pluginsToStart = installedPluginsLock.withLock {
@@ -334,6 +358,24 @@
             }
         }
 
+        private func tryStartScreenshotRender() -> Bool {
+            // Drop overlapping screenshot renders instead of queueing them up behind slow renders.
+            screenshotRenderLock.withLock {
+                if isScreenshotRenderInFlight {
+                    return false
+                }
+
+                isScreenshotRenderInFlight = true
+                return true
+            }
+        }
+
+        private func finishScreenshotRender() {
+            screenshotRenderLock.withLock {
+                isScreenshotRenderInFlight = false
+            }
+        }
+
         /// Determines whether the given session should be recorded based on sample rate configuration.
         /// Local config sample rate takes precedence over remote config.
         /// Returns `true` if no sample rate is configured (record everything).
@@ -400,27 +442,39 @@
             reevaluateSampling()
         }
 
-        /// Resets buffering state for a new session — clears the buffer and marks as not yet passed minimum duration.
+        /// Resets buffering state for a new session — clears the buffer, marks as not yet passed
+        /// minimum duration, and re-arms the first-remote-config gate only while the first `/config`
+        /// is still pending (e.g. a session rotation during an offline cold start). Once any `/config`
+        /// attempt has completed the gate stays disarmed — including across reset(), which keeps the
+        /// fetched config — so recording is not re-buffered.
         private func resetBufferingState(for _: PostHogSDK) {
+            let awaiting = shouldAwaitFirstRemoteConfig()
             bufferingLock.withLock {
                 hasPassedMinimumDuration = false
+                awaitingFirstRemoteConfig = awaiting
             }
 
             // Clear any buffered events from previous session
             replayQueue?.clearBuffer()
         }
 
+        private func shouldAwaitFirstRemoteConfig() -> Bool {
+            guard let remoteConfig = postHog?.remoteConfig else { return false }
+            return !remoteConfig.hasFetchedRemoteConfig
+        }
+
         private func pauseAllPlugins() {
-            let pluginsToPause = installedPluginsLock.withLock { installedPlugins }
-            for plugin in pluginsToPause {
-                plugin.pause()
-            }
+            updateAllPlugins { $0.pause() }
         }
 
         private func resumeAllPlugins() {
-            let pluginsToResume = installedPluginsLock.withLock { installedPlugins }
-            for plugin in pluginsToResume {
-                plugin.resume()
+            updateAllPlugins { $0.resume() }
+        }
+
+        private func updateAllPlugins(_ update: (PostHogSessionReplayPlugin) -> Void) {
+            let plugins = installedPluginsLock.withLock { installedPlugins }
+            for plugin in plugins {
+                update(plugin)
             }
         }
 
@@ -428,6 +482,125 @@
             updatePlugins(from: remoteConfig)
             updateEventTriggers(from: remoteConfig)
             updateCachedMinimumDuration()
+
+            // `processSessionRecordingConfig` flipped `sessionReplayFlagActive` before this callback,
+            // so this reads the fresh decision.
+            let flagActive = postHog?.remoteConfig?.isSessionReplayFlagActive() ?? false
+
+            // Mark the authoritative `/config` as resolved (lets the feature-flags path resolve the
+            // buffer after a failed first attempt), remembering whether this was the first one.
+            let wasFirstRemoteConfig = bufferingLock.withLock { () -> Bool in
+                let first = !didResolveRemoteConfig
+                didResolveRemoteConfig = true
+                return first
+            }
+
+            // For linkedFlag-gated recording the flag value isn't fresh at `/config` — `/flags` lands
+            // just after and re-evaluates it. Defer the first-config buffer resolve to that imminent
+            // `/flags` reload so the opening window isn't migrated on a stale flag. Only defer when a
+            // `/flags` reload will actually follow (preloadFeatureFlags); otherwise resolve here against
+            // the cached flag, since nothing else would ever resolve the buffer (it would buffer then
+            // drop the whole session).
+            let deferToFeatureFlags = wasFirstRemoteConfig
+                && (postHog?.config.preloadFeatureFlags ?? false)
+                && (postHog?.remoteConfig?.isRecordingGatedOnLinkedFlag() ?? false)
+
+            if !deferToFeatureFlags {
+                resolveFirstRemoteConfigBuffer(flagActive: flagActive)
+            }
+
+            if !flagActive, !wasFirstRemoteConfig {
+                // A later `/config` turning the flag off is a genuine mid-session disable (flags are
+                // loaded by now), so stop immediately instead of waiting for session rotation. The
+                // first `/config` is intentionally skipped: for a linkedFlag config it can evaluate
+                // false before `/flags` lands, and the capturer self-gates on the flag meanwhile, so
+                // recording resumes if `/flags` turns it on — a stop() here would never restart.
+                stop()
+            } else {
+                reevaluateSampling()
+            }
+        }
+
+        /// Drops the buffer if recording isn't permitted, else hands it to the minimum-duration gate
+        /// (not a force-flush). The `awaitingFirstRemoteConfig` flip is atomic under `bufferingLock`;
+        /// the clear/migrate runs after the lock to keep buffer I/O out of the critical section.
+        private func resolveFirstRemoteConfigBuffer(flagActive: Bool) {
+            let wasAwaiting = bufferingLock.withLock { () -> Bool in
+                guard awaitingFirstRemoteConfig else { return false }
+                awaitingFirstRemoteConfig = false
+                return true
+            }
+
+            guard wasAwaiting else { return }
+
+            // Keep the buffered opening window only if this session is recordable under the fresh
+            // config — flag on, still sampled in, and not gated behind a not-yet-fired event trigger.
+            // A stale cache that recorded the window for a session the fresh config now excludes (sampled
+            // out, or newly trigger-gated) must drop it, not migrate it, or it leaks against the fresh
+            // policy — `start()` enforces the same gates. These mirror the flag-off discard path.
+            if flagActive, isCurrentSessionSampledIn(), !shouldWaitForEventTriggers(), let replayQueue {
+                migrateBufferIfMinimumDurationMet(replayQueue)
+            } else {
+                replayQueue?.clearBuffer()
+            }
+        }
+
+        private func isCurrentSessionSampledIn() -> Bool {
+            guard let postHog,
+                  let sessionId = postHog.sessionManager.getSessionId(readOnly: true)
+            else {
+                return false
+            }
+            return shouldRecordSession(postHog: postHog, sessionId: sessionId)
+        }
+
+        /// Migrates the buffer to the persisted queue when it should be flushed now — no minimum
+        /// duration is configured, or the buffered window already spans it — and otherwise leaves it
+        /// buffering for the minimum-duration window. The caller must have confirmed replay is active.
+        private func migrateBufferIfMinimumDurationMet(_ replayQueue: PostHogReplayQueue) {
+            let minimumDuration = bufferingLock.withLock { cachedMinimumDuration }
+
+            guard let minimumDuration, minimumDuration > 0 else {
+                bufferingLock.withLock { hasPassedMinimumDuration = true }
+                replayQueue.migrateBufferToQueue()
+                return
+            }
+
+            guard (replayQueue.bufferDuration ?? 0) >= minimumDuration else { return }
+
+            hedgeLog("[Session Replay] Minimum duration met. Migrating \(replayQueue.bufferDepth) buffered events to replay queue.")
+            // Flip state before migration so new snapshots don't keep entering the buffer during long-running migrations.
+            bufferingLock.withLock { hasPassedMinimumDuration = true }
+            replayQueue.migrateBufferToQueue()
+        }
+
+        /// Resolves the buffer from a feature-flags reload — covers two paths:
+        /// (a) the **fallback** path after a failed first `/config` (offline launch), where
+        /// `applyRemoteConfig` never runs but a `/flags` reload still fires, and
+        /// (b) the **linkedFlag-deferred** path where the first `/config` succeeded but routed the
+        /// buffer resolve to the imminent `/flags` reload (the linkedFlag value isn't fresh until then).
+        /// Only acts once a `/config` attempt has completed, so it never resolves from a
+        /// pre-`/config` cache. The capturer self-gates on flag-off, so no stop() is needed here.
+        private func resolveBufferFromFeatureFlags() {
+            // A completed `/config` attempt (success or failure) makes the cached recording config as
+            // fresh as it will get; latch that locally so later reloads can still resolve.
+            let configAttempted = postHog?.remoteConfig?.hasFetchedRemoteConfig == true
+            // `wasResolved == false && canResolve == true` means applyRemoteConfig never ran for this
+            // process — i.e. the first /config attempt terminally failed and this is the fallback path.
+            let (canResolve, isFallback) = bufferingLock.withLock { () -> (Bool, Bool) in
+                let wasResolved = didResolveRemoteConfig
+                if configAttempted { didResolveRemoteConfig = true }
+                let canResolve = didResolveRemoteConfig && awaitingFirstRemoteConfig
+                return (canResolve, canResolve && !wasResolved)
+            }
+            guard canResolve else { return }
+
+            if isFallback {
+                hedgeLog("[Session Replay] First /config attempt did not complete. Falling back to the disk-cached recording config.")
+            }
+
+            let flagActive = postHog?.remoteConfig?.isSessionReplayFlagActive() ?? false
+            resolveFirstRemoteConfigBuffer(flagActive: flagActive)
         }
 
         private func updateCachedMinimumDuration() {
@@ -437,8 +610,10 @@
             }
         }
 
-        private func handleApplicationEvent(event: UIEvent, date: Date) {
-            guard let postHog, postHog.isSessionReplayActive() else {
+        func handleApplicationEvent(event: UIEvent, date: Date, window: UIWindow? = nil) {
+            guard let postHog, postHog.config.sessionReplayConfig.captureTouches,
+                  postHog.isSessionReplayActive()
+            else {
                 return
             }
 
@@ -446,7 +621,7 @@
                 return
             }
 
-            guard let window = UIApplication.getCurrentWindow() else {
+            guard let window = window ?? UIApplication.getCurrentWindow() else {
                 return
             }
 
@@ -511,49 +686,45 @@
             }
         }
 
-        private func generateSnapshot(_ window: UIWindow, _ screenName: String? = nil, postHog: PostHogSDK) {
-            var hasChanges = false
-
-            guard let wireframe = autoreleasepool(invoking: {
-                postHog.config.sessionReplayConfig.screenshotMode ? toScreenshotWireframe(window) : toWireframe(window)
-            }) else {
+        private func generateSnapshot(_ window: UIWindow, _ screenName: String? = nil, postHog: PostHogSDK, timestampDate: Date) {
+            guard
+                let wireframe = autoreleasepool(invoking: {
+                    toWireframe(window)
+                })
+            else {
                 return
             }
 
-            // capture timestamp after snapshot was taken
-            let timestampDate = Date()
+            captureSnapshot(
+                wireframe,
+                window: window,
+                windowSize: window.bounds.size,
+                screenName: screenName,
+                postHog: postHog,
+                timestampDate: timestampDate
+            )
+        }
+
+        func captureSnapshot(
+            _ wireframe: RRWireframe,
+            window: UIWindow,
+            windowSize: CGSize,
+            screenName: String?,
+            postHog: PostHogSDK,
+            timestampDate: Date,
+            episodeFirstFrame: Bool = false
+        ) {
             let timestamp = timestampDate.toMillis()
 
+            // Queued frames share this status; its fields are confined to dispatchQueue.
             let snapshotStatus = windowViewsLock.withLock {
-                windowViews.object(forKey: window) ?? ViewTreeSnapshotStatus()
-            }
-
-            var snapshotsData: [Any] = []
-
-            if !snapshotStatus.sentMetaEvent {
-                let size = window.bounds.size
-                let width = size.width.toInt() ?? 0
-                let height = size.height.toInt() ?? 0
-
-                var data: [String: Any] = ["width": width, "height": height]
-
-                if let screenName = screenName {
-                    data["href"] = screenName
+                if let status = windowViews.object(forKey: window) {
+                    return status
                 }
-
-                let snapshotData: [String: Any] = ["type": 4, "data": data, "timestamp": timestamp]
-                snapshotsData.append(snapshotData)
-                snapshotStatus.sentMetaEvent = true
-                hasChanges = true
+                let status = ViewTreeSnapshotStatus()
+                windowViews.setObject(status, forKey: window)
+                return status
             }
-
-            if hasChanges {
-                windowViewsLock.withLock {
-                    windowViews.setObject(snapshotStatus, forKey: window)
-                }
-            }
-
-            // TODO: IncrementalSnapshot, type=2
 
             PostHogReplayIntegration.dispatchQueue.async {
                 // always make sure we have a fresh session id at correct timestamp
@@ -561,9 +732,49 @@
                     return
                 }
 
+                // A new bridge episode needs fresh metadata even if its opening render fails.
+                if episodeFirstFrame {
+                    snapshotStatus.sentMetaEvent = false
+                }
+
                 let wireframeDict = autoreleasepool { wireframe.toDict() }
                 wireframe.image = nil
                 wireframe.maskableWidgets = nil
+
+                // Masking failed, so the only image left is the raw screenshot. Drop the
+                // frame instead of sending content the config masks (fail closed).
+                if wireframe.maskRenderFailed {
+                    hedgeLog("[Session Replay] Skipping snapshot: the masked screenshot could not be rendered")
+                    return
+                }
+
+                var snapshotsData: [Any] = []
+                if !snapshotStatus.sentMetaEvent {
+                    let width = windowSize.width.toInt() ?? 0
+                    let height = windowSize.height.toInt() ?? 0
+                    var data: [String: Any] = ["width": width, "height": height]
+                    if let screenName = screenName {
+                        data["href"] = screenName
+                    }
+                    let snapshotData: [String: Any] = ["type": 4, "data": data, "timestamp": timestamp]
+                    snapshotsData.append(snapshotData)
+                    snapshotStatus.sentMetaEvent = true
+                }
+
+                // Re-arm the hash on an episode's first frame so a recurring
+                // native screen always re-sends its opening frame.
+                if episodeFirstFrame {
+                    snapshotStatus.lastImageHash = nil
+                }
+                let imageHash = (wireframeDict["base64"] as? String)?.hashValue
+                if PostHogReplayIntegration.shouldSkipUnchangedScreenshot(
+                    imageHash: imageHash,
+                    lastImageHash: snapshotStatus.lastImageHash,
+                    hasPendingSnapshotData: !snapshotsData.isEmpty
+                ) {
+                    return
+                }
+                snapshotStatus.lastImageHash = imageHash
 
                 var wireframes: [Any] = []
                 wireframes.append(wireframeDict)
@@ -582,6 +793,11 @@
                     timestamp: timestampDate
                 )
             }
+        }
+
+        static func shouldSkipUnchangedScreenshot(imageHash: Int?, lastImageHash: Int?, hasPendingSnapshotData: Bool) -> Bool {
+            guard let imageHash, !hasPendingSnapshotData else { return false }
+            return imageHash == lastImageHash
         }
 
         private func setAlignment(_ alignment: NSTextAlignment, _ style: RRStyle) {
@@ -619,15 +835,41 @@
             return wireframe
         }
 
-        private func findMaskableWidgets(_ view: UIView, _ window: UIWindow, _ maskableWidgets: inout [CGRect], _ maskChildren: inout Bool) {
-            // User explicitly marked this view (and its subviews) as non-maskable through `.postHogNoMask()` view modifier
-            if view.postHogNoMask {
+        private func reactNativeSvgContent(in view: UIView) -> (hasText: Bool, hasGraphic: Bool) {
+            var hasText = false
+            var hasGraphic = false
+
+            for subview in view.subviews {
+                if let reactNativeSvgTextView, subview.isKind(of: reactNativeSvgTextView) {
+                    hasText = true
+                    continue
+                }
+
+                if let reactNativeSvgRenderableView, subview.isKind(of: reactNativeSvgRenderableView) {
+                    let isGroup = reactNativeSvgGroupView.map { subview.isKind(of: $0) } ?? false
+                    if !isGroup {
+                        hasGraphic = true
+                    }
+                }
+
+                let nestedContent = reactNativeSvgContent(in: subview)
+                hasText = hasText || nestedContent.hasText
+                hasGraphic = hasGraphic || nestedContent.hasGraphic
+            }
+
+            return (hasText, hasGraphic)
+        }
+
+        private func findMaskableWidgets(_ view: UIView, _ window: UIWindow, _ maskableWidgets: inout [MaskedRegion], _ maskChildren: Bool) {
+            // Checked first so an explicit unmask wins over the sensitive-type early-returns
+            // below, matching the modifier's precedence.
+            if view.isNoMask() {
                 return
             }
 
             if let textView = view as? UITextView { // TextEditor, SwiftUI.TextEditorTextView, SwiftUI.UIKitTextView
                 if isTextViewSensitive(textView) {
-                    maskableWidgets.append(view.toAbsoluteRect(window))
+                    maskableWidgets.append(.init(view, in: window))
                     return
                 }
             }
@@ -635,14 +877,21 @@
             /// SwiftUI: `TextField`, `SecureField` will land here
             if let textField = view as? UITextField {
                 if isTextFieldSensitive(textField) {
-                    maskableWidgets.append(view.toAbsoluteRect(window))
+                    maskableWidgets.append(.init(view, in: window))
                     return
                 }
             }
 
             if let reactNativeTextView = reactNativeTextView {
                 if view.isKind(of: reactNativeTextView), config?.sessionReplayConfig.maskAllTextInputs == true {
-                    maskableWidgets.append(view.toAbsoluteRect(window))
+                    maskableWidgets.append(.init(view, in: window))
+                    return
+                }
+            }
+
+            if let reactNativeParagraphView = reactNativeParagraphView {
+                if view.isKind(of: reactNativeParagraphView), config?.sessionReplayConfig.maskAllTextInputs == true {
+                    maskableWidgets.append(.init(view, in: window))
                     return
                 }
             }
@@ -650,21 +899,39 @@
             /// SwiftUI: Some control images like the ones in `Picker` view may land here
             if let image = view as? UIImageView {
                 if isImageViewSensitive(image) {
-                    maskableWidgets.append(view.toAbsoluteRect(window))
+                    maskableWidgets.append(.init(view, in: window))
                     return
                 }
             }
 
             if let reactNativeImageView = reactNativeImageView {
                 if view.isKind(of: reactNativeImageView), config?.sessionReplayConfig.maskAllImages == true {
-                    maskableWidgets.append(view.toAbsoluteRect(window))
+                    maskableWidgets.append(.init(view, in: window))
+                    return
+                }
+            }
+
+            if let reactNativeImageComponentView = reactNativeImageComponentView {
+                if view.isKind(of: reactNativeImageComponentView), config?.sessionReplayConfig.maskAllImages == true {
+                    maskableWidgets.append(.init(view, in: window))
+                    return
+                }
+            }
+
+            if let reactNativeSvgView, view.isKind(of: reactNativeSvgView) {
+                let content = reactNativeSvgContent(in: view)
+                let shouldMaskText = content.hasText && config?.sessionReplayConfig.maskAllTextInputs == true
+                let shouldMaskGraphics = content.hasGraphic && config?.sessionReplayConfig.maskAllImages == true
+                if shouldMaskText || shouldMaskGraphics {
+                    // SVG nodes share a drawing surface, so mask the root when enabled content is present.
+                    maskableWidgets.append(.init(view, in: window))
                     return
                 }
             }
 
             if let label = view as? UILabel { // Text, this code might never be reachable in SwiftUI, see swiftUIImageTypes instead
                 if isLabelSensitive(label) {
-                    maskableWidgets.append(view.toAbsoluteRect(window))
+                    maskableWidgets.append(.init(view, in: window))
                     return
                 }
             }
@@ -673,7 +940,7 @@
                 // since we cannot mask the webview content, if masking texts or images are enabled
                 // we mask the whole webview as well
                 if isAnyInputSensitive(webView) {
-                    maskableWidgets.append(view.toAbsoluteRect(window))
+                    maskableWidgets.append(.init(view, in: window))
                     return
                 }
             }
@@ -681,7 +948,7 @@
             /// SwiftUI: `SwiftUI.UIKitIconPreferringButton` and other subclasses will land here
             if let button = view as? UIButton {
                 if isButtonSensitive(button) {
-                    maskableWidgets.append(view.toAbsoluteRect(window))
+                    maskableWidgets.append(.init(view, in: window))
                     return
                 }
             }
@@ -689,7 +956,7 @@
             /// SwiftUI: `Toggle` (no text, labels are just rendered to Text (swiftUIImageTypes))
             if let theSwitch = view as? UISwitch {
                 if isSwitchSensitive(theSwitch) {
-                    maskableWidgets.append(view.toAbsoluteRect(window))
+                    maskableWidgets.append(.init(view, in: window))
                     return
                 }
             }
@@ -699,7 +966,7 @@
                let systemSandboxedView,
                view.isKind(of: systemSandboxedView)
             {
-                maskableWidgets.append(view.toAbsoluteRect(window))
+                maskableWidgets.append(.init(view, in: window))
                 return
             }
 
@@ -709,7 +976,7 @@
             /// SwiftUI: `Picker` with .pickerStyle(.wheel) will land here
             if let picker = view as? UIPickerView {
                 if isTextInputSensitive(picker), !hasSubViews {
-                    maskableWidgets.append(picker.toAbsoluteRect(window))
+                    maskableWidgets.append(.init(picker, in: window))
                     return
                 }
             }
@@ -717,7 +984,7 @@
             /// SwiftUI: Text based views like `Text`, `Button`, `TextEditor`
             if swiftUITextBasedViewTypes.contains(where: view.isKind(of:)) {
                 if isTextInputSensitive(view), !hasSubViews {
-                    maskableWidgets.append(view.toAbsoluteRect(window))
+                    maskableWidgets.append(.init(view, in: window))
                     return
                 }
             }
@@ -725,7 +992,7 @@
             /// SwiftUI: Image based views like `Image`, `AsyncImage`. (Note: We check the layer type here)
             if swiftUIImageLayerTypes.contains(where: view.layer.isKind(of:)) {
                 if isSwiftUIImageSensitive(view), !hasSubViews {
-                    maskableWidgets.append(view.toAbsoluteRect(window))
+                    maskableWidgets.append(.init(view, in: window))
                     return
                 }
             }
@@ -746,73 +1013,69 @@
             // this can be anything, so better to be conservative
             if swiftUIGenericTypes.contains(where: { view.isKind(of: $0) }), !isSwiftUILayerSafe(view.layer) {
                 if isTextInputSensitive(view), !hasSubViews {
-                    maskableWidgets.append(view.toAbsoluteRect(window))
+                    maskableWidgets.append(.init(view, in: window))
                     return
                 }
             }
 
-            // manually masked views through `.postHogMask()` view modifier
-            if view.postHogNoCapture {
-                maskableWidgets.append(view.toAbsoluteRect(window))
-                return
-            }
-
             // on RN, lots get converted to RCTRootContentView, RCTRootView, RCTView and sometimes its just the whole screen, we dont want to mask
             // in such cases
+            var maskDescendants = maskChildren
             if view.isNoCapture() || maskChildren {
                 let viewRect = view.toAbsoluteRect(window)
                 let windowRect = window.frame
 
                 // Check if the rectangles do not match
                 if !viewRect.equalTo(windowRect) {
-                    maskableWidgets.append(view.toAbsoluteRect(window))
+                    maskableWidgets.append(.init(view, in: window))
                 } else {
-                    maskChildren = true
+                    maskDescendants = true
                 }
             }
 
             if !view.subviews.isEmpty {
                 for child in view.subviews {
-                    if !child.isVisible() {
+                    if !child.isVisibleForMasking() {
                         continue
                     }
 
-                    findMaskableWidgets(child, window, &maskableWidgets, &maskChildren)
+                    findMaskableWidgets(child, window, &maskableWidgets, maskDescendants)
                 }
             }
-            maskChildren = false
         }
 
         /// Recursively iterate through layer hierarchy to find maskable layers (iOS 26+)
         ///
         /// On iOS 26, SwiftUI primitives (Text, Image, Button) are rendered as CALayer sublayers
-        /// of parent views rather than having their own backing UIView. When `.postHogMask()` is applied,
-        /// the flag is set directly on the CALayers via the PostHogTagViewModifier.
+        /// of parent views rather than having their own backing UIView, so the text/image
+        /// heuristics below inspect layers as well. (`.postHogMask()` regions are collected
+        /// separately via the mask-reporter registry.)
         @available(iOS 26.0, *)
-        private func findMaskableLayers(_ layer: CALayer, _ view: UIView, _ window: UIWindow, _ maskableWidgets: inout [CGRect]) {
+        private func findMaskableLayers(_ layer: CALayer, _ view: UIView, _ window: UIWindow, _ maskableWidgets: inout [MaskedRegion]) {
             for sublayer in layer.sublayers ?? [] {
                 // Skip layers tagged with .postHogNoMask()
                 if sublayer.postHogNoMask {
                     continue
                 }
 
-                // Check if layer is manually tagged with .postHogMask()
-                if sublayer.postHogNoCapture {
-                    maskableWidgets.append(sublayer.toAbsoluteRect(window))
+                // Skip backing layers for child UIViews. Those are visited when
+                // findMaskableWidgets recurses into the child view, so traversing
+                // them here would duplicate large layer subtrees on iOS 26.
+                if let sublayerView = sublayer.delegate as? UIView, sublayerView !== view {
                     continue
                 }
 
                 // Text-based layers
                 if swiftUITextBasedViewTypes.contains(where: sublayer.isKind(of:)) {
                     if isTextInputSensitive(view) {
-                        maskableWidgets.append(sublayer.toAbsoluteRect(window))
+                        maskableWidgets.append(.init(sublayer, in: window))
                     }
                 }
 
                 // Image layers
                 if swiftUIImageLayerTypes.contains(where: sublayer.isKind(of:)) {
                     if isSwiftUIImageSensitive(view) {
-                        maskableWidgets.append(sublayer.toAbsoluteRect(window))
+                        maskableWidgets.append(.init(sublayer, in: window))
                     }
                 }
 
@@ -823,29 +1086,155 @@
             }
         }
 
-        private func toScreenshotWireframe(_ window: UIWindow) -> RRWireframe? {
+        private func prepareScreenshotWireframe(_ window: UIWindow, overrideMaskRects: [CGRect]? = nil) -> RRWireframe? {
             // this will bail on view controller animations (interactive or not)
             if !window.isVisible() || isAnimatingTransition(window) {
                 return nil
             }
 
-            var maskableWidgets: [CGRect] = []
-            var maskChildren = false
-            findMaskableWidgets(window, window, &maskableWidgets, &maskChildren)
+            // nil = a mask reporter has no geometry yet; capturing now could show that
+            // content unmasked. Skip the tick (fail closed), like the transition bail.
+            // overrideMaskRects: the settle check's drift band passes swept-region rects
+            // measured moments ago, so masks cover the travel path instead of one instant.
+            guard let maskableWidgets = overrideMaskRects ?? collectMaskableRects(in: window) else {
+                hedgeLog("[Session Replay] Skipping snapshot: a masked view hasn't been laid out yet")
+                return nil
+            }
 
             let wireframe = createBasicWireframe(window)
-
-            if let image = window.toImage() {
-                if !image.size.hasSize() {
-                    return nil
-                }
-
-                wireframe.maskableWidgets = maskableWidgets
-
-                wireframe.image = image
-            }
+            wireframe.maskableWidgets = maskableWidgets
             wireframe.type = "screenshot"
             return wireframe
+        }
+
+        /// All regions to redact in `window`: heuristic widgets from the hierarchy walk plus the
+        /// live regions of `postHogMask()` reporters. Returns nil when a reporter hasn't laid out
+        /// yet — the caller must skip the frame rather than capture it under-masked.
+        /// Pre-existing limitation with `screenshotModeBackgroundCapture` (off by default): pixels
+        /// render after this collection, so any rect source can go stale for content committed in
+        /// between.
+        private func collectMaskedRegions(in window: UIWindow) -> [MaskedRegion]? {
+            // The cheap registry read can veto the frame; keep it before the walk.
+            let masked = PostHogSessionReplayMaskRegistry.shared.maskedRects(in: window)
+            guard !masked.hasUnsettledReporters else {
+                return nil
+            }
+
+            var maskableWidgets: [MaskedRegion] = []
+            findMaskableWidgets(window, window, &maskableWidgets, false)
+            maskableWidgets.append(contentsOf: masked.regions)
+            return maskableWidgets
+        }
+
+        func collectMaskableRects(in window: UIWindow) -> [CGRect]? {
+            collectMaskedRegions(in: window)?.map(\.rect)
+        }
+
+        private struct ScreenshotCapture {
+            let wireframe: RRWireframe
+            let windowSize: CGSize
+            let timestampDate: Date
+            let image: UIImage?
+        }
+
+        // To be called from main thread
+        private func collectScreenshotMetadata(
+            _ window: UIWindow,
+            preferFidelityRenderer: Bool = true,
+            overrideMaskRects: [CGRect]? = nil,
+            renderImage: Bool = true
+        ) -> ScreenshotCapture? {
+            guard let wireframe = autoreleasepool(invoking: { prepareScreenshotWireframe(window, overrideMaskRects: overrideMaskRects) }) else {
+                return nil
+            }
+
+            // The settled path renders here so the pixels come from the same main-thread tick that
+            // measured the mask rects — any later and the presentation tree has moved on. Callers
+            // that render themselves (background capture, the bridge's first frame) pass false.
+            let image = renderImage ? window.toImage(preferFidelityRenderer: preferFidelityRenderer) : nil
+
+            return ScreenshotCapture(wireframe: wireframe, windowSize: window.bounds.size, timestampDate: Date(), image: image)
+        }
+
+        @discardableResult
+        private func renderAndEnqueueScreenshot(
+            _ wireframe: RRWireframe,
+            window: UIWindow,
+            windowSize: CGSize,
+            screenName: String?,
+            postHog: PostHogSDK,
+            timestampDate: Date,
+            image collectedImage: UIImage?,
+            episodeFirstFrame: Bool = false
+        ) -> Bool {
+            autoreleasepool {
+                // Only the settle-checked path picks a renderer by band; every other path keeps
+                // drawHierarchy. The bridge's first frame needs afterScreenUpdates: true on top —
+                // a freshly-presented native VC renders black otherwise.
+                let image = collectedImage ?? window.toImage(afterScreenUpdates: episodeFirstFrame, preferFidelityRenderer: true)
+                guard let image, image.size.hasSize() else {
+                    return false
+                }
+                wireframe.image = image
+                captureSnapshot(
+                    wireframe,
+                    window: window,
+                    windowSize: windowSize,
+                    screenName: screenName,
+                    postHog: postHog,
+                    timestampDate: timestampDate,
+                    episodeFirstFrame: episodeFirstFrame
+                )
+                return true
+            }
+        }
+
+        @discardableResult
+        private func performScreenshotCapture(
+            window: UIWindow,
+            screenName: String?,
+            postHog: PostHogSDK,
+            episodeFirstFrame: Bool = false,
+            preferFidelityRenderer: Bool = true,
+            overrideMaskRects: [CGRect]? = nil
+        ) -> Bool {
+            defer { finishScreenshotRender() }
+
+            // Ahead of the render, not just after it: collect() now renders the image, so a session
+            // that stopped between the snapshot trigger and here would otherwise pay for a
+            // full-window render and throw it away.
+            guard postHog.isSessionReplayActive() else {
+                return false
+            }
+
+            // The bridge's first frame needs its own `afterScreenUpdates: true` pass, so it renders
+            // later in renderAndEnqueueScreenshot rather than in this tick. Both callers arrive on
+            // main already; the sync below is defensive.
+            let rendersInMeasuringTick = Thread.isMainThread && !episodeFirstFrame
+            func collect() -> ScreenshotCapture? {
+                collectScreenshotMetadata(
+                    window,
+                    preferFidelityRenderer: preferFidelityRenderer,
+                    overrideMaskRects: overrideMaskRects,
+                    renderImage: rendersInMeasuringTick
+                )
+            }
+            let screenshotCapture = Thread.isMainThread ? collect() : DispatchQueue.main.sync(execute: collect)
+
+            guard let screenshotCapture, postHog.isSessionReplayActive() else {
+                return false
+            }
+
+            return renderAndEnqueueScreenshot(
+                screenshotCapture.wireframe,
+                window: window,
+                windowSize: screenshotCapture.windowSize,
+                screenName: screenName,
+                postHog: postHog,
+                timestampDate: screenshotCapture.timestampDate,
+                image: screenshotCapture.image,
+                episodeFirstFrame: episodeFirstFrame
+            )
         }
 
         /// Check if any view controller in the hierarchy is animating a transition
@@ -1090,6 +1479,118 @@
             return wireframe
         }
 
+        /// Captures the current native window for the native-screen bridge.
+        /// [episodeFirstFrame] renders with `afterScreenUpdates` so a
+        /// freshly-presented screen isn't captured black, and re-arms the
+        /// meta/hash so a retried opening frame keeps its reset — pass it
+        /// until the episode's first frame has been captured, and drop it
+        /// afterwards (it flickers secure fields). The Boolean reports enqueueing,
+        /// not the outcome of asynchronous masking; see captureSessionReplaySnapshot.
+        @discardableResult
+        func captureBridgeSnapshot(episodeFirstFrame: Bool, window: UIWindow? = nil) -> Bool {
+            guard Thread.isMainThread else {
+                return DispatchQueue.main.sync {
+                    captureBridgeSnapshot(episodeFirstFrame: episodeFirstFrame, window: window)
+                }
+            }
+            guard let postHog, postHog.isSessionReplayActive() else {
+                return false
+            }
+            guard let window = window ?? UIApplication.getCurrentWindow() else {
+                return false
+            }
+            // A mid-transition capture renders black; the next tick gets it.
+            if isAnimatingTransition(window) {
+                return false
+            }
+            guard tryStartScreenshotRender() else {
+                return false
+            }
+            // Name the visible covering screen, not the window's root:
+            // bridged frames show the presented native screen, and the replay
+            // meta should say so. ph_topViewController also descends nav/tab
+            // containers to their visible child.
+            let screenName = UIViewController.ph_topViewController(base: window.rootViewController)
+                .flatMap(UIViewController.getViewControllerName)
+            return performScreenshotCapture(
+                window: window,
+                screenName: screenName,
+                postHog: postHog,
+                episodeFirstFrame: episodeFirstFrame
+            )
+        }
+
+        /// The render sits between two mask samples instead of one: measure geometry, render
+        /// off-main, measure again, mask the per-owner union — provably covering wherever the
+        /// content sat while the render ran, so no threshold is needed. Always uses
+        /// `drawHierarchy`, never the presentation-tree renderer: that reads `layer.presentation()`,
+        /// which is main-only, and this path's other reads already sit inside `main.sync`.
+        @discardableResult
+        private func performBracketedBackgroundCapture(window: UIWindow, screenName: String?, postHog: PostHogSDK) -> Bool {
+            defer { finishScreenshotRender() }
+
+            let before = DispatchQueue.main.sync { self.collectMaskedRegions(in: window) }
+            // Off-main on purpose, and the reason this mode exists: drawHierarchy on main was too
+            // slow to keep up. UIKit documents it as main-thread-only, so it stays experimental
+            // behind `screenshotModeBackgroundCapture` — the bracketing above is what keeps masks
+            // aligned with pixels despite the render happening on this thread.
+            let image = window.toImage(preferFidelityRenderer: true)
+            let capture = DispatchQueue.main.sync { () -> ScreenshotCapture? in
+                let after = self.collectMaskedRegions(in: window)
+                guard let rects = Self.sweptRects(before: before, after: after) else {
+                    hedgeLog("[Session Replay] Skipping snapshot: mask samples could not be paired")
+                    return nil
+                }
+                // No renderer preference: `renderImage: false` means this call never renders — the
+                // image was already taken off-main above.
+                return self.collectScreenshotMetadata(window, overrideMaskRects: rects, renderImage: false)
+            }
+
+            guard let capture, let image, postHog.isSessionReplayActive() else {
+                return false
+            }
+
+            return renderAndEnqueueScreenshot(
+                capture.wireframe,
+                window: window,
+                windowSize: capture.windowSize,
+                screenName: screenName,
+                postHog: postHog,
+                timestampDate: capture.timestampDate,
+                image: image
+            )
+        }
+
+        /// Settle-then-shoot: after one display-pipeline depth, unchanged mask geometry proves the
+        /// displayed frame identical to the current tree, so full-fidelity drawHierarchy is safe
+        /// (blur/video/Metal intact); drift within budget keeps drawHierarchy with masks swept to
+        /// cover it, only motion or an unpairable sample drops to render(in:) for alignment.
+        private func scheduleSettledCapture(window: UIWindow, screenName: String?, postHog: PostHogSDK) {
+            // Same bails prepareScreenshotWireframe applies, hoisted ahead of the two sampling
+            // walks: without this a view controller transition pays for both traversals and then
+            // discards them, where before it walked the hierarchy zero times.
+            guard window.isVisible(), !isAnimatingTransition(window) else {
+                finishScreenshotRender()
+                return
+            }
+
+            let sentinelRegions = collectMaskedRegions(in: window)
+            DispatchQueue.main.asyncAfter(deadline: .now() + Self.settleWindowSeconds) { [weak self] in
+                guard let self else { return }
+                let regionsNow = self.collectMaskedRegions(in: window)
+                // Banded on mask geometry alone, not on layout-event counts: layout events arrive in
+                // bursts, so a count false-positives on the very burst that triggered the capture.
+                let verdict = Self.settleVerdict(before: sentinelRegions, after: regionsNow)
+                self.performScreenshotCapture(
+                    window: window,
+                    screenName: screenName,
+                    postHog: postHog,
+                    preferFidelityRenderer: verdict.band.usesFidelity,
+                    overrideMaskRects: verdict.inflatedRects ?? regionsNow?.map(\.rect)
+                )
+            }
+        }
+
         @objc private func snapshot() {
             guard let postHog, postHog.isSessionReplayActive() else {
                 return
@@ -1100,6 +1601,7 @@
             }
 
             var screenName: String?
+
             if let controller = window.rootViewController {
                 // SwiftUI only supported with screenshotMode
                 if controller is AnyObjectUIHostingViewController, !postHog.config.sessionReplayConfig.screenshotMode {
@@ -1111,9 +1613,23 @@
                 }
             }
 
-            // this cannot run off of the main thread because most properties require to be called within the main thread
-            // this method has to be fast and do as little as possible
-            generateSnapshot(window, screenName, postHog: postHog)
+            if postHog.config.sessionReplayConfig.screenshotMode {
+                guard tryStartScreenshotRender() else {
+                    return
+                }
+
+                if postHog.config.sessionReplayConfig.screenshotModeBackgroundCapture {
+                    PostHogReplayIntegration.dispatchQueue.async { [weak self] in
+                        self?.performBracketedBackgroundCapture(window: window, screenName: screenName, postHog: postHog)
+                    }
+                } else {
+                    scheduleSettledCapture(window: window, screenName: screenName, postHog: postHog)
+                }
+                return
+            }
+
+            // Wireframe mode always stays on main thread
+            generateSnapshot(window, screenName, postHog: postHog, timestampDate: Date())
         }
 
         private func handleEventCaptured(event: String) {
@@ -1151,6 +1667,10 @@
             // Parse event triggers from remote config
             // Path: sessionRecording.eventTriggers ([String])
             let remoteEventTriggers: [String]? = {
+                // React Native evaluates event triggers in its JS layer; RN-captured events never reach
+                // the native capture() pipeline, so the native gate can't be satisfied. Don't store
+                // triggers for RN — the JS layer owns them (linkedFlag and sampling gates still apply).
+                guard isNotReactNative() else { return nil }
                 guard let sessionRecording = remoteConfig?["sessionRecording"] as? [String: Any],
                       let triggers = sessionRecording["eventTriggers"] as? [String]
                 else {
@@ -1225,6 +1745,9 @@
     extension PostHogReplayIntegration: PostHogReplayBufferDelegate {
         var isBuffering: Bool {
             bufferingLock.withLock {
+                if awaitingFirstRemoteConfig {
+                    return true
+                }
                 guard let minimumDuration = cachedMinimumDuration,
                       minimumDuration > 0
                 else {
@@ -1235,25 +1758,22 @@
         }
 
         func replayQueueDidBufferSnapshot(_ replayQueue: PostHogReplayQueue) {
-            guard postHog != nil else { return }
+            guard let postHog else { return }
 
-            let minimumDuration: TimeInterval? = bufferingLock.withLock { cachedMinimumDuration }
-            guard let minimumDuration, minimumDuration > 0 else {
-                // No minimum duration configured: should not be buffering, migrate immediately
-                bufferingLock.withLock { hasPassedMinimumDuration = true }
-                replayQueue.migrateBufferToQueue()
-                return
-            }
+            let awaiting = bufferingLock.withLock { awaitingFirstRemoteConfig }
 
-            // Check buffer content duration (oldest to newest snapshot)
-            let bufferDuration = replayQueue.bufferDuration ?? 0
+            // Never drain the buffer to the persisted queue while the first remote config is pending.
+            // This callback fires on every buffered add; its migrate decision is duration-gated and
+            // independent of the add-routing gate, so without this a cached minimumDuration could
+            // migrate stale-cache snapshots before the flag decision and leak them to the network.
+            guard !awaiting else { return }
 
-            if bufferDuration >= minimumDuration {
-                hedgeLog("[Session Replay] Minimum duration met. Migrating \(replayQueue.bufferDepth) buffered events to replay queue.")
-                // Flip state before migration so new snapshots don't keep entering the buffer during long-running migrations.
-                bufferingLock.withLock { hasPassedMinimumDuration = true }
-                replayQueue.migrateBufferToQueue()
-            }
+            // Only persist the buffered window while replay is actually active. On a flag-off resolve
+            // the buffer is cleared asynchronously; this stops an in-flight add() that began buffering
+            // before the flag flipped from migrating the stale window into the persisted queue.
+            guard postHog.isSessionReplayActive() else { return }
+
+            migrateBufferIfMinimumDurationMet(replayQueue)
         }
     }
 
@@ -1264,9 +1784,7 @@
     #if TESTING
         extension PostHogReplayIntegration {
             static func clearInstalls() {
-                integrationInstalledLock.withLock {
-                    integrationInstalled = false
-                }
+                integrationInstallState.clear()
             }
         }
     #endif

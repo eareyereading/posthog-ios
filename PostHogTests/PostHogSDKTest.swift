@@ -8,9 +8,17 @@
 import Foundation
 import Nimble
 @testable import PostHog
+#if SWIFT_PACKAGE
+    import PostHogTestsObjC
+#endif
 import Quick
 
 class PostHogSDKTest: QuickSpec {
+    // Every SDK getSut creates is tracked and closed in afterEach. An unclosed SDK leaks its
+    // queues, timers, URLSession and observers; across ~40 instances per run those pile up and
+    // starve the background thread pool, stalling async work (flag loads, flushes) on CI.
+    private var trackedSuts: [PostHogSDK] = []
+
     func getSut(preloadFeatureFlags: Bool = false,
                 sendFeatureFlagEvent: Bool = false,
                 captureApplicationLifecycleEvents: Bool = false,
@@ -41,7 +49,9 @@ class PostHogSDKTest: QuickSpec {
         let storage = PostHogStorage(config)
         storage.reset()
 
-        return PostHogSDK.with(config)
+        let sut = PostHogSDK.with(config)
+        trackedSuts.append(sut)
+        return sut
     }
 
     func getBeforeSendEventsConfig() -> [BeforeSendTestEventContext] {
@@ -108,8 +118,233 @@ class PostHogSDKTest: QuickSpec {
         }
         afterEach {
             now = { Date() }
+            // Close every SDK created this test so its queues/timers/observers don't leak into the
+            // next one (close() is idempotent, so tests that already closed their sut are fine).
+            self.trackedSuts.forEach { $0.close() }
+            self.trackedSuts.removeAll()
             server.stop()
             server = nil
+        }
+
+        it("no-ops setup when project token is empty after trimming") {
+            let config = PostHogConfig(projectToken: " \n\t ", host: "http://localhost:9001")
+
+            let sut = PostHogSDK.with(config)
+
+            expect(sut.config.projectToken).to(beEmpty())
+            expect(sut.storage).to(beNil())
+            expect(sut.getDistinctId()).to(beEmpty())
+            expect(sut.getSessionId()).to(beNil())
+        }
+
+        it("no-ops setup when legacy api key is empty after trimming") {
+            let config = PostHogConfig(apiKey: " \n\t ", host: "http://localhost:9001")
+
+            let sut = PostHogSDK.with(config)
+
+            expect(sut.config.projectToken).to(beEmpty())
+            expect(sut.storage).to(beNil())
+            expect(sut.getDistinctId()).to(beEmpty())
+            expect(sut.getSessionId()).to(beNil())
+        }
+
+        func bootstrapReconcileConfig(existing: (anon: String, distinct: String?, identified: Bool)) -> PostHogConfig {
+            let config = PostHogConfig(projectToken: testProjectToken, host: "http://localhost:9001")
+            config.disableReachabilityForTesting = true
+            config.disableQueueTimerForTesting = true
+            config.disableFlushOnBackgroundForTesting = true
+
+            let storage = PostHogStorage(config)
+            storage.reset()
+            storage.setString(forKey: .anonymousId, contents: existing.anon)
+            if let distinct = existing.distinct {
+                storage.setString(forKey: .distinctId, contents: distinct)
+            }
+            if existing.identified {
+                storage.setBool(forKey: .isIdentified, contents: true)
+            }
+            return config
+        }
+
+        it("merges an anonymous local user into an identified bootstrap") {
+            let config = bootstrapReconcileConfig(existing: (anon: "anon-abc", distinct: nil, identified: false))
+            config.bootstrap = PostHogBootstrapConfig(distinctId: "user-123", isIdentifiedId: true)
+
+            let sut = PostHogSDK.with(config)
+            self.trackedSuts.append(sut)
+
+            // the anonymous user is merged into the identified bootstrap ID
+            expect(sut.getDistinctId()) == "user-123"
+            expect(config.storageManager?.isIdentified()) == true
+            // the anonymous ID is preserved so the $identify links the merge ($anon_distinct_id)
+            expect(sut.getAnonymousId()) == "anon-abc"
+        }
+
+        it("preserves a different already-identified local user against an identified bootstrap") {
+            let config = bootstrapReconcileConfig(existing: (anon: "anon-xyz", distinct: "user-existing", identified: true))
+            config.bootstrap = PostHogBootstrapConfig(distinctId: "user-123", isIdentifiedId: true)
+
+            let sut = PostHogSDK.with(config)
+            self.trackedSuts.append(sut)
+
+            // the existing identity wins; the bootstrap is ignored
+            expect(sut.getDistinctId()) == "user-existing"
+            expect(config.storageManager?.isIdentified()) == true
+        }
+
+        it("upgrades a matching anonymous id to identified via an identified bootstrap") {
+            let config = bootstrapReconcileConfig(existing: (anon: "user-123", distinct: nil, identified: false))
+            config.bootstrap = PostHogBootstrapConfig(distinctId: "user-123", isIdentifiedId: true)
+
+            let sut = PostHogSDK.with(config)
+            self.trackedSuts.append(sut)
+
+            // matching id: the user is upgraded to identified without re-linking
+            expect(sut.getDistinctId()) == "user-123"
+            expect(config.storageManager?.isIdentified()) == true
+        }
+
+        it("reconciles an identified bootstrap while opted out") {
+            let config = bootstrapReconcileConfig(existing: (anon: "anon-xyz", distinct: nil, identified: false))
+            config.optOut = true
+            config.bootstrap = PostHogBootstrapConfig(distinctId: "user-456", isIdentifiedId: true)
+
+            let sut = PostHogSDK.with(config)
+            self.trackedSuts.append(sut)
+
+            // opted out: local identity is still reconciled, only event emission is suppressed
+            expect(sut.getDistinctId()) == "user-456"
+            expect(config.storageManager?.isIdentified()) == true
+        }
+
+        it("early lifecycle events carry the reconciled bootstrap identity") {
+            let config = bootstrapReconcileConfig(existing: (anon: "anon-abc", distinct: nil, identified: false))
+            config.captureApplicationLifecycleEvents = true
+            // reconcile emits $identify, then Application Installed captures on install; flush both together
+            config.flushAt = 2
+            config.bootstrap = PostHogBootstrapConfig(distinctId: "user-123", isIdentifiedId: true)
+
+            let sut = PostHogSDK.with(config)
+            self.trackedSuts.append(sut)
+
+            // reconcile runs before installIntegrations, so the Application Installed event captured
+            // synchronously on install carries the merged bootstrap identity, not the old anonymous id
+            let events = getBatchedEvents(server)
+            let installed = events.first { $0.event == "Application Installed" }
+            expect(installed).toNot(beNil())
+            expect(installed?.distinctId) == "user-123"
+        }
+
+        // The .never asymmetry below is intentional posthog-js parity: the fresh-install seed applies the
+        // identity via an ungated write, while the returning-anon path routes through identify(), which
+        // no-ops under .never. These lock in that behavior so it isn't "made consistent" by mistake.
+        it("applies an identified bootstrap on a fresh install even when personProfiles is never") {
+            let config = PostHogConfig(projectToken: testProjectToken, host: "http://localhost:9001")
+            config.disableReachabilityForTesting = true
+            config.disableQueueTimerForTesting = true
+            config.disableFlushOnBackgroundForTesting = true
+            config.personProfiles = .never
+            PostHogStorage(config).reset() // fresh install: no persisted identity
+            config.bootstrap = PostHogBootstrapConfig(distinctId: "user-123", isIdentifiedId: true)
+
+            let sut = PostHogSDK.with(config)
+            self.trackedSuts.append(sut)
+
+            // fresh-install seed applies the identity directly, without the person-processing gate
+            expect(sut.getDistinctId()) == "user-123"
+            expect(config.storageManager?.isIdentified()) == true
+        }
+
+        it("drops a differing identified bootstrap for a returning anonymous user when personProfiles is never") {
+            let config = bootstrapReconcileConfig(existing: (anon: "anon-abc", distinct: nil, identified: false))
+            config.personProfiles = .never
+            config.bootstrap = PostHogBootstrapConfig(distinctId: "user-123", isIdentifiedId: true)
+
+            let sut = PostHogSDK.with(config)
+            self.trackedSuts.append(sut)
+
+            // returning-anon path routes through identify(), which no-ops under .never, so the bootstrap
+            // identity is dropped and the existing anonymous id is preserved
+            expect(sut.getDistinctId()) == "anon-abc"
+            expect(config.storageManager?.isIdentified()) == false
+        }
+
+        it("drops a differing identified bootstrap for a returning anonymous user when personProfiles is never and opted out") {
+            let config = bootstrapReconcileConfig(existing: (anon: "anon-abc", distinct: nil, identified: false))
+            config.personProfiles = .never
+            config.optOut = true
+            config.bootstrap = PostHogBootstrapConfig(distinctId: "user-456", isIdentifiedId: true)
+
+            let sut = PostHogSDK.with(config)
+            self.trackedSuts.append(sut)
+
+            // .never gates the reconcile regardless of opt-out, so the outcome matches the non-opted-out case above
+            expect(sut.getDistinctId()) == "anon-abc"
+            expect(config.storageManager?.isIdentified()) == false
+        }
+
+        it("identifies an anonymous user via identify() when the id already matches the persisted distinct id") {
+            // Anonymous user whose persisted id already equals the id being identified with
+            // (e.g. a non-identified bootstrap seeded the same id).
+            let config = bootstrapReconcileConfig(existing: (anon: "user-123", distinct: nil, identified: false))
+            config.captureApplicationLifecycleEvents = false
+            config.flushAt = 1
+
+            let sut = PostHogSDK.with(config)
+            self.trackedSuts.append(sut)
+
+            sut.identify("user-123")
+
+            // No $identify (nothing to merge); a single person-processed $set marks the transition.
+            let events = getBatchedEvents(server)
+            expect(events.count) == 1
+            expect(events.first?.event) == "$set"
+            expect(events.first?.properties["$process_person_profile"] as? Bool) == true
+            expect(config.storageManager?.isIdentified()) == true
+        }
+
+        it("does not emit a second $set on a repeated matching-id identify") {
+            let config = bootstrapReconcileConfig(existing: (anon: "user-123", distinct: nil, identified: false))
+            config.captureApplicationLifecycleEvents = false
+            config.flushAt = 2
+
+            let sut = PostHogSDK.with(config)
+            self.trackedSuts.append(sut)
+
+            sut.identify("user-123") // transition: one $set
+            sut.identify("user-123") // already identified: no event
+            sut.capture("event") // flushes the batch (flushAt 2)
+
+            let events = getBatchedEvents(server)
+            expect(events.count) == 2
+            expect(events[0].event) == "$set"
+            expect(events[1].event) == "event"
+        }
+
+        it("forwards userProperties and userPropertiesSetOnce on a matching-id identify") {
+            let config = bootstrapReconcileConfig(existing: (anon: "user-123", distinct: nil, identified: false))
+            config.captureApplicationLifecycleEvents = false
+            config.flushAt = 1
+
+            let sut = PostHogSDK.with(config)
+            self.trackedSuts.append(sut)
+
+            sut.identify("user-123", userProperties: ["foo": "bar"], userPropertiesSetOnce: ["baz": "qux"])
+
+            let events = getBatchedEvents(server)
+            expect(events.count) == 1
+
+            let event = events.first!
+            expect(event.event) == "$set"
+            expect(event.properties["$process_person_profile"] as? Bool) == true
+
+            let set = event.properties["$set"] as? [String: Any] ?? [:]
+            expect(set["foo"] as? String) == "bar"
+
+            let setOnce = event.properties["$set_once"] as? [String: Any] ?? [:]
+            expect(setOnce["baz"] as? String) == "qux"
+
+            expect(config.storageManager?.isIdentified()) == true
         }
 
         it("captures the capture event") {
@@ -141,6 +376,18 @@ class PostHogSDKTest: QuickSpec {
 
             sut.reset()
             sut.close()
+        }
+
+        it("invokes reloadFeatureFlags callback when not enabled") {
+            let sut = self.getSut()
+            sut.close()
+
+            var called = false
+            sut.reloadFeatureFlags {
+                called = true
+            }
+
+            expect(called).to(beTrue())
         }
 
         it("captures a screen event") {
@@ -261,7 +508,7 @@ class PostHogSDKTest: QuickSpec {
         it("loads feature flags automatically") {
             let sut = self.getSut(preloadFeatureFlags: true)
 
-            waitFlagsRequest(server)
+            waitForFeatureFlagsLoaded(server, sut)
             expect(sut.isFeatureEnabled("bool-value")) == true
 
             sut.reset()
@@ -271,7 +518,7 @@ class PostHogSDKTest: QuickSpec {
         it("send feature flag event for isFeatureEnabled when enabled") {
             let sut = self.getSut(preloadFeatureFlags: true, sendFeatureFlagEvent: true)
 
-            waitFlagsRequest(server)
+            waitForFeatureFlagsLoaded(server, sut)
             expect(sut.isFeatureEnabled("bool-value")) == true
 
             let events = getBatchedEvents(server)
@@ -286,6 +533,7 @@ class PostHogSDKTest: QuickSpec {
             expect(event.properties["$feature_flag_id"] as? Int) == 2
             expect(event.properties["$feature_flag_version"] as? Int) == 23
             expect(event.properties["$feature_flag_reason"] as? String) == "Matched condition set 3"
+            expect(event.properties["$feature_flag_has_experiment"] as? Bool) == true
 
             sut.reset()
             sut.close()
@@ -294,7 +542,7 @@ class PostHogSDKTest: QuickSpec {
         it("send feature flag event with variant response for isFeatureEnabled when enabled") {
             let sut = self.getSut(preloadFeatureFlags: true, sendFeatureFlagEvent: true)
 
-            waitFlagsRequest(server)
+            waitForFeatureFlagsLoaded(server, sut)
             expect(sut.isFeatureEnabled("string-value")) == true
 
             let events = getBatchedEvents(server)
@@ -309,6 +557,173 @@ class PostHogSDKTest: QuickSpec {
             expect(event.properties["$feature_flag_id"] as? Int) == 3
             expect(event.properties["$feature_flag_version"] as? Int) == 1
             expect(event.properties["$feature_flag_reason"] as? String) == "Matched condition set 1"
+            expect(event.properties["$feature_flag_has_experiment"] as? Bool) == false
+
+            sut.reset()
+            sut.close()
+        }
+
+        it("send feature flag event without has_experiment when server omits it") {
+            let sut = self.getSut(preloadFeatureFlags: true, sendFeatureFlagEvent: true)
+
+            waitForFeatureFlagsLoaded(server, sut)
+            expect(sut.isFeatureEnabled("number-value")) == true
+
+            let events = getBatchedEvents(server)
+
+            expect(events.count) == 1
+
+            let event = events.first!
+            expect(event.event) == "$feature_flag_called"
+            expect(event.properties["$feature_flag"] as? String) == "number-value"
+            expect(event.properties["$feature_flag_has_experiment"]).to(beNil())
+
+            sut.reset()
+            sut.close()
+        }
+
+        it("sends minimal feature flag event when gated and flag has no experiment") {
+            server.minimalFlagCalledEvents = true
+            let sut = self.getSut(preloadFeatureFlags: true, sendFeatureFlagEvent: true)
+
+            waitForFeatureFlagsLoaded(server, sut)
+            expect(sut.isFeatureEnabled("string-value")) == true
+
+            let events = getBatchedEvents(server)
+
+            expect(events.count) == 1
+
+            let event = events.first!
+            expect(event.event) == "$feature_flag_called"
+            // Strict allowlist: everything else (super properties, $active_feature_flags,
+            // $feature/<key>, $is_identified) is stripped; $os_name/$os_version/$app_version
+            // survive as mobile's OS- and app-version-breakdown analog.
+            expect(Set(event.properties.keys)) == Set([
+                "$feature_flag",
+                "$feature_flag_response",
+                "$feature_flag_has_experiment",
+                "$feature_flag_id",
+                "$feature_flag_version",
+                "$feature_flag_reason",
+                "$feature_flag_request_id",
+                "$feature_flag_evaluated_at",
+                "$process_person_profile",
+                "$session_id",
+                "$lib",
+                "$lib_version",
+                "$os_name",
+                "$os_version",
+                "$app_version",
+            ])
+            expect(event.properties["$feature_flag"] as? String) == "string-value"
+            expect(event.properties["$feature_flag_response"] as? String) == "test"
+            expect(event.properties["$feature_flag_has_experiment"] as? Bool) == false
+
+            sut.reset()
+            sut.close()
+        }
+
+        it("keeps $groups on minimal feature flag events") {
+            server.minimalFlagCalledEvents = true
+            // flushAt 2 so the $groupidentify and $feature_flag_called events share one batch
+            let sut = self.getSut(preloadFeatureFlags: true, sendFeatureFlagEvent: true, flushAt: 2)
+
+            waitForFeatureFlagsLoaded(server, sut)
+
+            sut.group(type: "some-type", key: "some-key")
+
+            expect(sut.isFeatureEnabled("string-value")) == true
+
+            let events = getBatchedEvents(server)
+
+            expect(events.count) == 2
+
+            let event = events.last!
+            expect(event.event) == "$feature_flag_called"
+            // $groups is correctness-required (ingestion dedup key + personful routing for group
+            // flags), so it must survive minimization when groups are registered.
+            expect(Set(event.properties.keys)) == Set([
+                "$feature_flag",
+                "$feature_flag_response",
+                "$feature_flag_has_experiment",
+                "$feature_flag_id",
+                "$feature_flag_version",
+                "$feature_flag_reason",
+                "$feature_flag_request_id",
+                "$feature_flag_evaluated_at",
+                "$groups",
+                "$process_person_profile",
+                "$session_id",
+                "$lib",
+                "$lib_version",
+                "$os_name",
+                "$os_version",
+                "$app_version",
+            ])
+            let groups = event.properties["$groups"] as? [String: String]
+            expect(groups?["some-type"]) == "some-key"
+
+            sut.reset()
+            sut.close()
+        }
+
+        it("sends full feature flag event when gated but flag has an experiment") {
+            server.minimalFlagCalledEvents = true
+            let sut = self.getSut(preloadFeatureFlags: true, sendFeatureFlagEvent: true)
+
+            waitForFeatureFlagsLoaded(server, sut)
+            expect(sut.isFeatureEnabled("bool-value")) == true
+
+            let events = getBatchedEvents(server)
+
+            expect(events.count) == 1
+
+            let event = events.first!
+            expect(event.event) == "$feature_flag_called"
+            expect(event.properties["$feature_flag_has_experiment"] as? Bool) == true
+            expect(event.properties["$feature/bool-value"] as? Bool) == true
+            expect(event.properties["$active_feature_flags"]).toNot(beNil())
+            expect(event.properties["$is_identified"]).toNot(beNil())
+
+            sut.reset()
+            sut.close()
+        }
+
+        it("sends full feature flag event when gated but has_experiment is unknown") {
+            server.minimalFlagCalledEvents = true
+            let sut = self.getSut(preloadFeatureFlags: true, sendFeatureFlagEvent: true)
+
+            waitForFeatureFlagsLoaded(server, sut)
+            expect(sut.isFeatureEnabled("number-value")) == true
+
+            let events = getBatchedEvents(server)
+
+            expect(events.count) == 1
+
+            let event = events.first!
+            expect(event.event) == "$feature_flag_called"
+            expect(event.properties["$feature_flag_has_experiment"]).to(beNil())
+            expect(event.properties["$active_feature_flags"]).toNot(beNil())
+
+            sut.reset()
+            sut.close()
+        }
+
+        it("sends full feature flag event when the server does not gate minimal events") {
+            let sut = self.getSut(preloadFeatureFlags: true, sendFeatureFlagEvent: true)
+
+            waitForFeatureFlagsLoaded(server, sut)
+            expect(sut.isFeatureEnabled("string-value")) == true
+
+            let events = getBatchedEvents(server)
+
+            expect(events.count) == 1
+
+            let event = events.first!
+            expect(event.event) == "$feature_flag_called"
+            expect(event.properties["$feature_flag_has_experiment"] as? Bool) == false
+            expect(event.properties["$feature/string-value"] as? String) == "test"
+            expect(event.properties["$active_feature_flags"]).toNot(beNil())
 
             sut.reset()
             sut.close()
@@ -317,7 +732,7 @@ class PostHogSDKTest: QuickSpec {
         it("send feature flag event for getFeatureFlag when enabled") {
             let sut = self.getSut(preloadFeatureFlags: true, sendFeatureFlagEvent: true)
 
-            waitFlagsRequest(server)
+            waitForFeatureFlagsLoaded(server, sut)
             expect(sut.getFeatureFlag("bool-value") as? Bool) == true
 
             let events = getBatchedEvents(server)
@@ -336,7 +751,7 @@ class PostHogSDKTest: QuickSpec {
         it("force send feature flag event for getFeatureFlag when config disabled") {
             let sut = self.getSut(preloadFeatureFlags: true, sendFeatureFlagEvent: false)
 
-            waitFlagsRequest(server)
+            waitForFeatureFlagsLoaded(server, sut)
             expect(sut.getFeatureFlag("bool-value", sendFeatureFlagEvent: true) as? Bool) == true
 
             let events = getBatchedEvents(server)
@@ -355,7 +770,7 @@ class PostHogSDKTest: QuickSpec {
         it("don't send feature flag event for getFeatureFlag when config enabled") {
             let sut = self.getSut(preloadFeatureFlags: true, sendFeatureFlagEvent: true)
 
-            waitFlagsRequest(server)
+            waitForFeatureFlagsLoaded(server, sut)
             expect(sut.getFeatureFlag("bool-value", sendFeatureFlagEvent: false) as? Bool) == true
 
             let events = getBatchedEvents(server, failIfNotCompleted: false)
@@ -443,7 +858,7 @@ class PostHogSDKTest: QuickSpec {
             let sut = self.getSut()
 
             sut.reloadFeatureFlags()
-            waitFlagsRequest(server)
+            waitForFeatureFlagsLoaded(server, sut)
 
             sut.capture("event")
 
@@ -458,6 +873,31 @@ class PostHogSDKTest: QuickSpec {
 
             expect(event.properties["$feature/bool-value"] as? Bool) == true
             expect(event.properties["$feature/disabled-flag"] as? Bool) == false
+
+            sut.reset()
+            sut.close()
+        }
+
+        it("caller-supplied feature flag properties override cached values") {
+            let sut = self.getSut()
+
+            sut.reloadFeatureFlags()
+            waitForFeatureFlagsLoaded(server, sut)
+
+            sut.capture("event", properties: [
+                "$feature/bool-value": "server-value",
+                "$active_feature_flags": ["server-flag"],
+            ])
+
+            let events = getBatchedEvents(server)
+
+            expect(events.count) == 1
+            let event = events.first!
+
+            expect(event.properties["$feature/bool-value"] as? String) == "server-value"
+            let activeFlags = event.properties["$active_feature_flags"] as? [Any] ?? []
+            expect(activeFlags.count) == 1
+            expect(activeFlags.first as? String) == "server-flag"
 
             sut.reset()
             sut.close()
@@ -632,15 +1072,25 @@ class PostHogSDKTest: QuickSpec {
 
             sut.reset()
 
-            waitFlagsRequest(server)
+            waitForFeatureFlagsLoaded(server, sut)
             expect(sut.isFeatureEnabled("bool-value")) == true
 
             sut.close()
         }
 
-        it("captures an event with a custom timestamp") {
+        it("captures an event with a custom timestamp as the equivalent UTC instant") {
             let sut = self.getSut()
-            let eventDate = Date().addingTimeInterval(-60 * 30)
+            var calendar = Calendar(identifier: .gregorian)
+            calendar.timeZone = TimeZone(secondsFromGMT: 5 * 60 * 60 + 30 * 60)!
+            let eventDate = calendar.date(from: DateComponents(
+                year: 2024,
+                month: 12,
+                day: 17,
+                hour: 22,
+                minute: 21,
+                second: 6,
+                nanosecond: 952_000_000
+            ))!
 
             sut.capture("test event",
                         properties: ["foo": "bar"],
@@ -650,24 +1100,25 @@ class PostHogSDKTest: QuickSpec {
                         timestamp: eventDate)
 
             let events = getBatchedEvents(server)
-
             expect(events.count) == 1
 
-            let event = events.first!
-            expect(event.event) == "test event"
+            let requestBody = server.parseRequest(server.batchRequests.first!)
+            let event = (requestBody?["batch"] as? [[String: Any]])?.first
 
-            expect(event.properties["foo"] as? String) == "bar"
+            expect(event?["event"] as? String) == "test event"
+            expect(event?["timestamp"] as? String) == "2024-12-17T16:51:06.952Z"
 
-            let set = event.properties["$set"] as? [String: Any] ?? [:]
+            let properties = event?["properties"] as? [String: Any] ?? [:]
+            expect(properties["foo"] as? String) == "bar"
+
+            let set = properties["$set"] as? [String: Any] ?? [:]
             expect(set["userProp"] as? String) == "value"
 
-            let setOnce = event.properties["$set_once"] as? [String: Any] ?? [:]
+            let setOnce = properties["$set_once"] as? [String: Any] ?? [:]
             expect(setOnce["userPropOnce"] as? String) == "value"
 
-            let groupProps = event.properties["$groups"] as? [String: String] ?? [:]
+            let groupProps = properties["$groups"] as? [String: String] ?? [:]
             expect(groupProps["groupProp"]) == "value"
-
-            expect(toISO8601String(event.timestamp)).to(equal(toISO8601String(eventDate)))
 
             sut.reset()
             sut.close()
@@ -683,6 +1134,8 @@ class PostHogSDKTest: QuickSpec {
 
             let event = getBatchedEvents(server)
             expect(event.first!.event).to(equal("$feature_flag_called"))
+            // v3 responses carry no flag details, so has_experiment is unknown and omitted
+            expect(event.first!.properties["$feature_flag_has_experiment"]).to(beNil())
         }
 
         it("does not capture $feature_flag_called when getFeatureFlag is called twice") {
@@ -878,6 +1331,52 @@ class PostHogSDKTest: QuickSpec {
                 let events = getBatchedEvents(server)
                 expect(events.count).to(equal(1))
                 expect(events[0].event).to(equal("other_test"))
+            }
+
+            it("runs boxed Objective-C callbacks through the exception boundary") {
+                sut = self.getSut(flushAt: 1)
+                let boxes: [NSObject] = [
+                    BoxedBeforeSendBlock { event in
+                        event.event = "boxed_modified_event"
+                        return event
+                    },
+                ]
+                PHBeforeSendExceptionTestFixture.setBeforeSend(boxes, on: sut.config)
+
+                sut.capture("original_event")
+
+                let events = getBatchedEvents(server)
+                expect(events.count).to(equal(1))
+                expect(events[0].event).to(equal("boxed_modified_event"))
+            }
+
+            it("contains Objective-C exceptions from boxed callbacks") {
+                sut = self.getSut(flushAt: 1)
+                var laterCallbackInvoked = false
+                let throwingBox = PHBeforeSendExceptionTestFixture.makeThrowingBox(BoxedBeforeSendBlock.self)
+                let boxes: [NSObject] = [
+                    throwingBox,
+                    BoxedBeforeSendBlock { event in
+                        laterCallbackInvoked = true
+                        return event
+                    },
+                ]
+                PHBeforeSendExceptionTestFixture.setBeforeSend(boxes, on: sut.config)
+
+                let returnedNormally = PHBeforeSendExceptionTestFixture.invokeWithoutException {
+                    sut.capture("objc_exception_event")
+                }
+                sut.flush()
+
+                guard let storage = sut.storage else {
+                    fail("Expected analytics storage to be configured")
+                    return
+                }
+                let persistedQueue = PostHogFileBackedQueue(queue: storage.url(forKey: .queue))
+                expect(returnedNormally).to(beTrue())
+                expect(laterCallbackInvoked).to(beFalse())
+                expect(persistedQueue.depth).to(equal(0))
+                expect(server.batchRequests).to(beEmpty())
             }
 
             describe("array edge cases") {

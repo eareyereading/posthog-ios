@@ -11,23 +11,28 @@
 
     @available(iOS 15, *)
     struct SurveySheet: View {
-        let survey: PostHogDisplaySurvey
-        let isSurveyCompleted: Bool
-        let currentQuestionIndex: Int
-        let onClose: () -> Void
-        let onNextQuestionClicked: (_ index: Int, _ response: PostHogSurveyResponse) -> Void
+        // Observed so the sheet re-renders when the displayed survey is updated in place
+        // (e.g. re-translated after a language change), not just when questions advance.
+        @ObservedObject var displayManager: SurveyDisplayController
+        // The `.sheet(item:)` snapshot: keeps content rendered while the sheet animates out
+        // after dismissal clears `displayedSurvey`.
+        let fallbackSurvey: PostHogDisplaySurvey
 
         @State private var sheetHeight: CGFloat = .zero
 
+        private var survey: PostHogDisplaySurvey {
+            displayManager.displayedSurvey ?? fallbackSurvey
+        }
+
         var body: some View {
-            surveyContent
-                .animation(.linear(duration: 0.25), value: currentQuestionIndex)
+            surveyContent(for: survey)
+                .animation(.linear(duration: 0.25), value: displayManager.currentQuestionIndex)
                 .readFrame(in: .named("survey-scroll-view")) { frame in
                     sheetHeight = frame.height
                 }
                 .toolbar {
                     ToolbarItem(placement: .topBarTrailing) {
-                        SurveyDismissButton(action: onClose)
+                        SurveyDismissButton(action: displayManager.dismissSurvey)
                     }
                 }
                 .surveyBottomSheet(height: sheetHeight)
@@ -35,31 +40,33 @@
         }
 
         @ViewBuilder
-        private var surveyContent: some View {
-            if isSurveyCompleted, appearance.displayThankYouMessage {
-                ConfirmationMessage(onClose: onClose)
-            } else if let currentQuestion {
+        private func surveyContent(for survey: PostHogDisplaySurvey) -> some View {
+            if displayManager.isSurveyCompleted, appearance.displayThankYouMessage {
+                ConfirmationMessage(onClose: displayManager.dismissSurvey)
+            } else if displayManager.showingIntroScreen {
+                IntroMessage(onStart: displayManager.dismissIntroScreen)
+            } else if let currentQuestion = currentQuestion(in: survey) {
                 switch currentQuestion {
                 case let currentQuestion as PostHogDisplayOpenQuestion:
                     OpenTextQuestionView(question: currentQuestion) { resp in
-                        onNextQuestionClicked(currentQuestionIndex, .openEnded(resp))
+                        displayManager.onNextQuestion(index: displayManager.currentQuestionIndex, response: .openEnded(resp))
                     }
                 case let currentQuestion as PostHogDisplayLinkQuestion:
                     LinkQuestionView(question: currentQuestion) { resp in
-                        onNextQuestionClicked(currentQuestionIndex, .link(resp))
+                        displayManager.onNextQuestion(index: displayManager.currentQuestionIndex, response: .link(resp))
                     }
                 case let currentQuestion as PostHogDisplayRatingQuestion:
                     RatingQuestionView(question: currentQuestion) { resp in
-                        onNextQuestionClicked(currentQuestionIndex, .rating(resp))
+                        displayManager.onNextQuestion(index: displayManager.currentQuestionIndex, response: .rating(resp))
                     }
                 case let currentQuestion as PostHogDisplayChoiceQuestion:
                     if currentQuestion.isMultipleChoice {
                         MultipleChoiceQuestionView(question: currentQuestion) { resp in
-                            onNextQuestionClicked(currentQuestionIndex, .multipleChoice(resp))
+                            displayManager.onNextQuestion(index: displayManager.currentQuestionIndex, response: .multipleChoice(resp))
                         }
                     } else {
                         SingleChoiceQuestionView(question: currentQuestion) { resp in
-                            onNextQuestionClicked(currentQuestionIndex, .singleChoice(resp))
+                            displayManager.onNextQuestion(index: displayManager.currentQuestionIndex, response: .singleChoice(resp))
                         }
                     }
                 default:
@@ -68,11 +75,11 @@
             }
         }
 
-        private var currentQuestion: PostHogDisplaySurveyQuestion? {
-            guard currentQuestionIndex <= survey.questions.count - 1 else {
+        private func currentQuestion(in survey: PostHogDisplaySurvey) -> PostHogDisplaySurveyQuestion? {
+            guard displayManager.currentQuestionIndex <= survey.questions.count - 1 else {
                 return nil
             }
-            return survey.questions[currentQuestionIndex]
+            return survey.questions[displayManager.currentQuestionIndex]
         }
 
         private var appearance: SwiftUISurveyAppearance {
@@ -180,6 +187,11 @@
         var thankYouMessageDescription: String?
         var thankYouMessageDescriptionContentType: PostHogDisplaySurveyTextContentType = .text
         var thankYouMessageCloseButtonText: String
+        var displayIntroScreen: Bool = false
+        var introScreenHeader: String = ""
+        var introScreenDescription: String?
+        var introScreenDescriptionContentType: PostHogDisplaySurveyTextContentType = .text
+        var introScreenButtonText: String = "Get started"
         var borderColor: Color
         var placeholder: String?
     }
@@ -214,8 +226,14 @@
                 inputTextColor: colorFrom(css: appearance?.inputTextColor),
                 displayThankYouMessage: appearance?.displayThankYouMessage ?? true,
                 thankYouMessageHeader: appearance?.thankYouMessageHeader ?? "Thank you for your feedback!",
+                thankYouMessageDescription: appearance?.thankYouMessageDescription,
                 thankYouMessageDescriptionContentType: appearance?.thankYouMessageDescriptionContentType ?? .text,
                 thankYouMessageCloseButtonText: appearance?.thankYouMessageCloseButtonText ?? "Close",
+                displayIntroScreen: appearance?.displayIntroScreen ?? false,
+                introScreenHeader: appearance?.introScreenHeader ?? "",
+                introScreenDescription: appearance?.introScreenDescription,
+                introScreenDescriptionContentType: appearance?.introScreenDescriptionContentType ?? .text,
+                introScreenButtonText: appearance?.introScreenButtonText ?? "Get started",
                 borderColor: colorFrom(css: appearance?.borderColor, defaultColor: .systemFill)
             )
         }

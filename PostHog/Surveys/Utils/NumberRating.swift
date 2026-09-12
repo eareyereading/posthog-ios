@@ -46,16 +46,18 @@
                     RoundedRectangle(cornerRadius: 6)
                         .stroke(appearance.borderColor, lineWidth: 2)
                 )
-                HStack {
-                    Text(lowerBoundLabel)
-                        .font(.callout)
-                        .foregroundColor(appearance.descriptionTextColor)
-                        .frame(alignment: .leading)
-                    Spacer()
-                    Text(upperBoundLabel)
-                        .font(.callout)
-                        .foregroundColor(appearance.descriptionTextColor)
-                        .frame(alignment: .trailing)
+                if !lowerBoundLabel.isEmpty || !upperBoundLabel.isEmpty {
+                    HStack {
+                        Text(lowerBoundLabel)
+                            .font(.callout)
+                            .foregroundColor(appearance.descriptionTextColor)
+                            .frame(alignment: .leading)
+                        Spacer()
+                        Text(upperBoundLabel)
+                            .font(.callout)
+                            .foregroundColor(appearance.descriptionTextColor)
+                            .frame(alignment: .trailing)
+                    }
                 }
             }
 
@@ -63,11 +65,8 @@
         }
 
         private func foregroundTextColor(selected: Bool) -> Color {
-            if selected {
-                return ratingButtonActiveColor.getContrastingTextColor()
-            } else {
-                return inputTextColor.opacity(0.5)
-            }
+            // The number sits on a rectangle filled with the active color, so contrast against it.
+            selected ? ratingButtonActiveColor.getContrastingTextColor() : inputTextColor.opacity(0.5)
         }
 
         private var ratingButtonColor: Color {

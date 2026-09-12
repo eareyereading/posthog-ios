@@ -1,6 +1,6 @@
 Pod::Spec.new do |s|
   s.name             = "PostHog"
-  s.version          = "3.57.5"
+  s.version          = "3.74.0"
   s.summary          = "The hassle-free way to add posthog to your iOS app."
 
   s.description      = <<-DESC
@@ -28,25 +28,30 @@ Pod::Spec.new do |s|
   # Vendored PLCrashReporter source (not available on watchOS/visionOS)
   s.libraries = 'c++'
   s.pod_target_xcconfig = {
+    'BUILD_LIBRARY_FOR_DISTRIBUTION' => 'YES',
     'GCC_PREPROCESSOR_DEFINITIONS' => '$(inherited) PLCR_PRIVATE PLCF_RELEASE_BUILD PLCRASHREPORTER_PREFIX=PH SWIFT_PACKAGE',
-    'HEADER_SEARCH_PATHS' => '$(inherited) "${PODS_TARGET_SRCROOT}/vendor/PHPLCrashReporter/Dependencies/protobuf-c" "${PODS_TARGET_SRCROOT}/vendor/PHPLCrashReporter/Dependencies/protobuf-c/protobuf-c" "${PODS_TARGET_SRCROOT}/vendor/PHPLCrashReporter/Source"',
-    'SWIFT_INCLUDE_PATHS' => '$(inherited) "${PODS_TARGET_SRCROOT}/PostHog/PrivateModules/phlibwebp" "${PODS_TARGET_SRCROOT}/PostHog/PrivateModules/PHPLCrashReporter"'
+    # Static-library source pods cannot resolve the underlying Objective-C module
+    # while verifying the emitted Swift interface. Xcode 16.2 still schedules
+    # verification when the build setting is NO, so pass the compiler flag as well.
+    'SWIFT_VERIFY_EMITTED_MODULE_INTERFACE' => 'NO',
+    'OTHER_SWIFT_FLAGS' => '$(inherited) -no-verify-emitted-module-interface',
+    'HEADER_SEARCH_PATHS' => '$(inherited) "${PODS_TARGET_SRCROOT}/vendor/PHPLCrashReporter/Source"',
+    'SWIFT_INCLUDE_PATHS' => '$(inherited) "${PODS_TARGET_SRCROOT}/PostHog/PrivateModules/phlibwebp" "${PODS_TARGET_SRCROOT}/PostHog/PrivateModules/PHPLCrashReporter" "${PODS_TARGET_SRCROOT}/PostHog/PrivateModules/PostHogObjCExceptionSupport"'
   }
 
   s.source_files = [
     'PostHog/**/*.{swift,h,hpp,m,mm,c,cpp}',
     'vendor/libwebp/**/*.{h,c}',
-    'vendor/PHPLCrashReporter/Source/**/*.{h,hpp,m,mm,c,cpp,S}',
-    'vendor/PHPLCrashReporter/Dependencies/protobuf-c/**/*.h',
-    'vendor/PHPLCrashReporter/Dependencies/protobuf-c/**/*.c'
+    'vendor/PHPLCrashReporter/Source/**/*.{h,hpp,m,mm,c,cpp,S}'
   ]
 
   # Only PostHog's umbrella header should be public; vendored implementation headers stay private.
   s.public_header_files = 'PostHog/PostHog.h'
   s.private_header_files = [
+    'PostHog/ObjCExceptionSupport/PHObjCExceptionCatcher.h',
+    'PostHog/ObjCExceptionSupport/PHURLSessionTaskSafeAccess.h',
     'vendor/libwebp/**/*.h',
-    'vendor/PHPLCrashReporter/Source/**/*.{h,hpp}',
-    'vendor/PHPLCrashReporter/Dependencies/protobuf-c/**/*.h'
+    'vendor/PHPLCrashReporter/Source/**/*.{h,hpp}'
   ]
 
   # Crash reporting is not supported on watchOS/visionOS

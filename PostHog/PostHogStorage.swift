@@ -70,11 +70,9 @@ func appGroupContainerUrl(config: PostHogConfig) -> URL? {
 
 func getBundleIdentifier() -> String {
     #if TESTING // only visible to test targets
-        return Bundle.main.bundleIdentifier ?? "com.posthog.test"
+        return bundleIdentifier(fallback: "com.posthog.test")
     #else
-        // Can be nil for command-line tools, XCTest hosts, Swift Playgrounds etc
-        // Should theoretically never be nil for a shipping app
-        return Bundle.main.bundleIdentifier ?? "com.posthog.unknown"
+        return bundleIdentifier(fallback: "com.posthog.unknown")
     #endif
 }
 
@@ -232,8 +230,10 @@ class PostHogStorage {
         case queue = "posthog.queueFolder.uuid" // queue from > 3.48.1
         case oldQueueFolder = "posthog.queueFolder" // queue from 3.0.0 - 3.48.1
         case oldQueuePlist = "posthog.queue.plist" // queue from pre-3.0.0
-        case replayQeueue = "posthog.replayFolder"
+        case replayQeueue = "posthog.replayFolder.uuid" // replay queue with UUID filenames
+        case oldReplayQueue = "posthog.replayFolder" // replay queue with legacy timestamp filenames
         case replayBufferQueue = "posthog.replayBufferFolder"
+        case logsQueue = "posthog.logsFolder"
         case enabledFeatureFlags = "posthog.enabledFeatureFlags"
         case enabledFeatureFlagPayloads = "posthog.enabledFeatureFlagPayloads"
         case flags = "posthog.flags"
@@ -248,10 +248,15 @@ class PostHogStorage {
         case lastSeenSurveyDate = "posthog.lastSeenSurveyDate"
         case requestId = "posthog.requestId"
         case evaluatedAt = "posthog.evaluatedAt"
+        case minimalFlagCalledEvents = "posthog.minimalFlagCalledEvents"
         case personPropertiesForFlags = "posthog.personPropertiesForFlags"
         case groupPropertiesForFlags = "posthog.groupPropertiesForFlags"
         case errorTracking = "posthog.errorTracking"
+        case capturePerformance = "posthog.capturePerformance"
         case deviceId = "posthog.deviceId"
+        case pushSubscription = "posthog.pushSubscription"
+        case pushPendingUnregister = "posthog.pushPendingUnregister"
+        case pushAppIdsMigrated = "posthog.pushAppIdsMigrated"
     }
 
     // The location for storing data that we always want to keep
@@ -381,10 +386,20 @@ class PostHogStorage {
     }
 
     private static func getAppFolderUrl(from configuration: PostHogConfig) -> URL {
-        let apiDir = getBaseAppFolderUrl(from: configuration)
+        var apiDir = getBaseAppFolderUrl(from: configuration)
             .appendingPathComponent(configuration.projectToken)
 
         createDirectoryAtURLIfNeeded(url: apiDir)
+
+        // Exclude the entire SDK subtree, including queues and existing installations.
+        // The parent bundle/app-group folder may also contain unrelated application data.
+        do {
+            var resourceValues = URLResourceValues()
+            resourceValues.isExcludedFromBackup = true
+            try apiDir.setResourceValues(resourceValues)
+        } catch {
+            hedgeLog("Failed to exclude storage directory from backup: \(error)")
+        }
 
         return apiDir
     }
@@ -395,25 +410,38 @@ class PostHogStorage {
         if !keepAnonymousId {
             deleteSafely(url(forKey: .anonymousId))
         }
-        // .queue, .replayQeueue not needed since it'll be deleted by the queue.clear()
+        // .queue, .replayQeueue, .logsQueue not deleted here — each queue manages its own
+        // disk state via clear() and the per-record distinctId captured at enqueue time
+        // (see PostHogLogRecord) lets in-flight telemetry survive an identity change.
         deleteSafely(url(forKey: .oldQueueFolder))
         deleteSafely(url(forKey: .oldQueuePlist))
+        deleteSafely(url(forKey: .oldReplayQueue))
         deleteSafely(url(forKey: .flags))
         deleteSafely(url(forKey: .enabledFeatureFlags))
         deleteSafely(url(forKey: .enabledFeatureFlagPayloads))
         deleteSafely(url(forKey: .groups))
         deleteSafely(url(forKey: .registerProperties))
         deleteSafely(url(forKey: .optOut))
-        deleteSafely(url(forKey: .sessionReplay))
         deleteSafely(url(forKey: .isIdentified))
         deleteSafely(url(forKey: .personProcessingEnabled))
-        deleteSafely(url(forKey: .remoteConfig))
+        // .remoteConfig is project-level config (not user data); kept across reset() so features re-arm
         deleteSafely(url(forKey: .surveySeen))
         deleteSafely(url(forKey: .lastSeenSurveyDate))
         deleteSafely(url(forKey: .requestId))
+        deleteSafely(url(forKey: .minimalFlagCalledEvents))
         deleteSafely(url(forKey: .personPropertiesForFlags))
         deleteSafely(url(forKey: .groupPropertiesForFlags))
+        // legacy slices, no longer written (config now lives in .remoteConfig); drop stragglers from older SDKs
+        deleteSafely(url(forKey: .sessionReplay))
         deleteSafely(url(forKey: .errorTracking))
+        deleteSafely(url(forKey: .capturePerformance))
+        // .pushSubscription is deliberately NOT cleared here: PostHogPushSubscriptionHandler.recordForReset()
+        // clears it under its own recordLock (before this runs) so a concurrent send() can't write a
+        // fresh record into the gap and have it erased unlocked. When there is no push handler
+        // (feature disabled/absent), no record exists to leak, so skipping the clear here is safe.
+        // .pushPendingUnregister is deliberately NOT cleared here: it holds a durable "delete this
+        // subscription" intent for the identity being logged out of, and must outlive reset() so an
+        // offline/failed unregister keeps retrying on flush()/next launch (see PostHogPushSubscriptionHandler).
     }
 
     func remove(key: StorageKey) {
@@ -423,13 +451,7 @@ class PostHogStorage {
     }
 
     func getString(forKey key: StorageKey) -> String? {
-        let value = getJson(forKey: key)
-        if let stringValue = value as? String {
-            return stringValue
-        } else if let dictValue = value as? [String: String] {
-            return dictValue[key.rawValue]
-        }
-        return nil
+        getTypedValue(forKey: key)
     }
 
     func setString(forKey key: StorageKey, contents: String) {
@@ -445,10 +467,14 @@ class PostHogStorage {
     }
 
     func getBool(forKey key: StorageKey) -> Bool? {
+        getTypedValue(forKey: key)
+    }
+
+    private func getTypedValue<T>(forKey key: StorageKey) -> T? {
         let value = getJson(forKey: key)
-        if let boolValue = value as? Bool {
-            return boolValue
-        } else if let dictValue = value as? [String: Bool] {
+        if let typedValue = value as? T {
+            return typedValue
+        } else if let dictValue = value as? [String: T] {
             return dictValue[key.rawValue]
         }
         return nil

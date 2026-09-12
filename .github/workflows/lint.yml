@@ -4,21 +4,55 @@ on:
     branches:
       - main
   pull_request:
-    paths-ignore:
-      - "**/*.md"
 
 permissions:
   contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  lint:
-    runs-on: macos-latest
+  detect-markdown-only:
+    uses: PostHog/.github/.github/workflows/detect-markdown-only.yml@ec25337d9fae0100622cbfea1bd5bd88284ac10b
+    permissions:
+      pull-requests: read
+
+  swiftformat:
+    needs: detect-markdown-only
+    name: SwiftFormat
+    runs-on: macos-26
     steps:
-      - uses: actions/checkout@v6
+      - name: Complete markdown-only PR check
+        if: needs.detect-markdown-only.outputs.markdown_only == 'true'
+        run: echo "Only Markdown files changed; no additional work is required for this check."
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: needs.detect-markdown-only.outputs.markdown_only != 'true'
 
-      - name: Install linting tools
+      # TEMPORARY (July 2026): runner images mid-rollout ship different preinstalled SwiftFormat
+      # versions; 0.61 fails to parse the wrapIfStatementBodies disable in .swiftformat (rule added
+      # in 0.62). Remove once all macos-26 runners ship SwiftFormat >= 0.62.
+      - name: Upgrade SwiftFormat if it predates configured rules
+        if: needs.detect-markdown-only.outputs.markdown_only != 'true'
         run: |
-          brew install swiftlint swiftformat
+          if ! swiftformat --rules | grep -q wrapIfStatementBodies; then
+            brew update && brew upgrade swiftformat
+          fi
 
-      - name: Run lints
-        run: make lint
+      - name: Check formatting
+        if: needs.detect-markdown-only.outputs.markdown_only != 'true'
+        run: make swiftFormatCheck
+
+  swiftlint:
+    needs: detect-markdown-only
+    name: SwiftLint
+    runs-on: macos-26
+    steps:
+      - name: Complete markdown-only PR check
+        if: needs.detect-markdown-only.outputs.markdown_only == 'true'
+        run: echo "Only Markdown files changed; no additional work is required for this check."
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: needs.detect-markdown-only.outputs.markdown_only != 'true'
+
+      - name: Run SwiftLint
+        if: needs.detect-markdown-only.outputs.markdown_only != 'true'
+        run: make swiftLintCheck

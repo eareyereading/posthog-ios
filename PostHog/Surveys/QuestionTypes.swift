@@ -169,7 +169,7 @@
         let question: PostHogDisplayChoiceQuestion
         let onNextQuestion: (String?) -> Void
 
-        @State private var selectedChoices: Set<String> = []
+        @State private var selectedChoices: Set<Int> = []
         @State private var openChoiceInput: String = ""
 
         var body: some View {
@@ -189,12 +189,18 @@
                 )
 
                 BottomSection(label: question.buttonText ?? appearance.submitButtonText) {
-                    let response = selectedChoices.first
-                    let openChoiceInput = openChoiceInput.trimmingCharacters(in: .whitespaces)
-                    onNextQuestion(response == openChoice ? openChoiceInput : response)
+                    onNextQuestion(response)
                 }
                 .disabled(!canSubmit)
             }
+        }
+
+        private var response: String? {
+            guard let index = selectedChoices.first, index < question.choices.count else { return nil }
+            if index == openChoiceIndex(for: question) {
+                return openChoiceInput.trimmingCharacters(in: .whitespaces)
+            }
+            return question.choices[index]
         }
 
         private var canSubmit: Bool {
@@ -203,13 +209,7 @@
         }
 
         private var hasOpenChoiceSelected: Bool {
-            guard let openChoice else { return false }
-            return selectedChoices.contains(openChoice)
-        }
-
-        private var openChoice: String? {
-            guard question.hasOpenChoice == true else { return nil }
-            return question.choices.last
+            isOpenChoiceSelected(in: selectedChoices, for: question)
         }
     }
 
@@ -220,7 +220,7 @@
         let question: PostHogDisplayChoiceQuestion
         let onNextQuestion: ([String]?) -> Void
 
-        @State private var selectedChoices: Set<String> = []
+        @State private var selectedChoices: Set<Int> = []
         @State private var openChoiceInput: String = ""
 
         var body: some View {
@@ -240,11 +240,19 @@
                 )
 
                 BottomSection(label: question.buttonText ?? appearance.submitButtonText) {
-                    let resp = selectedChoices.map { $0 == openChoice ? openChoiceInput : $0 }
-                    onNextQuestion(resp.isEmpty ? nil : resp)
+                    onNextQuestion(response)
                 }
                 .disabled(!canSubmit)
             }
+        }
+
+        private var response: [String]? {
+            let openIndex = openChoiceIndex(for: question)
+            let resp = selectedChoices.sorted().compactMap { index -> String? in
+                guard index < question.choices.count else { return nil }
+                return index == openIndex ? openChoiceInput : question.choices[index]
+            }
+            return resp.isEmpty ? nil : resp
         }
 
         private var canSubmit: Bool {
@@ -253,13 +261,17 @@
         }
 
         private var hasOpenChoiceSelected: Bool {
-            guard let openChoice else { return false }
-            return selectedChoices.contains(openChoice)
+            isOpenChoiceSelected(in: selectedChoices, for: question)
         }
+    }
 
-        private var openChoice: String? {
-            guard question.hasOpenChoice == true else { return nil }
-            return question.choices.last
-        }
+    private func openChoiceIndex(for question: PostHogDisplayChoiceQuestion) -> Int? {
+        guard question.hasOpenChoice == true else { return nil }
+        return question.choices.count - 1
+    }
+
+    private func isOpenChoiceSelected(in selectedChoices: Set<Int>, for question: PostHogDisplayChoiceQuestion) -> Bool {
+        guard let openIndex = openChoiceIndex(for: question) else { return false }
+        return selectedChoices.contains(openIndex)
     }
 #endif

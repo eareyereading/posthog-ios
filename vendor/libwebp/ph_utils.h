@@ -13,6 +13,7 @@
 //          Urvang (urvang@google.com)
 
 #pragma clang diagnostic ignored "-Wquoted-include-in-framework-header"
+#include "./phlibwebp_prefix.h"
 #ifndef WEBP_UTILS_UTILS_H_
 #define WEBP_UTILS_UTILS_H_
 
@@ -58,7 +59,11 @@ static inline void posthog_ASSERT(bool condition, const char *file, int line) {
 /**
  * Macro to capture FILE and LINE for `posthog_ASSERT`.
  */
+#if defined(__clang_analyzer__)
+#define ASSERT(condition) do { if (!(condition)) __builtin_unreachable(); } while (0)
+#else
 #define ASSERT(condition) posthog_ASSERT((condition) ? true : false, __FILE__, __LINE__)
+#endif
 
 
 static WEBP_INLINE int CheckSizeOverflow(uint64_t size) {

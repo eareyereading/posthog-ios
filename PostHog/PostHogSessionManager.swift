@@ -7,8 +7,11 @@
 
 import Foundation
 
-// only for internal use
-// Do we need to expose this as public API? Could be internal static instead?
+/// Manages the active PostHog session ID and session rotation state.
+///
+/// - Warning: This class is public for backwards compatibility, but is intended for
+///   SDK-internal use only. Application code should use `PostHogSDK.getSessionId()`,
+///   `startSession()`, and `endSession()` instead of interacting with this manager directly.
 @objc public class PostHogSessionManager: NSObject {
     enum SessionIDChangeReason: String {
         case sessionIdEmpty = "Session id was empty"
@@ -20,6 +23,7 @@ import Foundation
         case customSessionId = "Custom session set"
     }
 
+    /// Session manager used by `PostHogSDK.shared`.
     @objc public static var shared: PostHogSessionManager {
         PostHogSDK.shared.sessionManager
     }
@@ -35,6 +39,12 @@ import Foundation
         didBecomeActiveToken = nil
         didEnterBackgroundToken = nil
         applicationEventToken = nil
+        // Seed from the publisher rather than relying on a future
+        // didBecomeActive — NotificationCenter doesn't replay past events,
+        // so a late setup() would otherwise stay stuck at the initial
+        // `true` until the next foreground/background transition.
+        let backgrounded = DI.main.appLifecyclePublisher.isInBackground
+        sessionLock.withLock { isAppInBackground = backgrounded }
         registerNotifications()
         registerApplicationSendEvent()
     }
@@ -59,6 +69,11 @@ import Foundation
     /// callback for session ID changes
     var onSessionIdChanged = PostHogMulticastCallback<Void>()
 
+    /// Overrides the current session ID.
+    ///
+    /// Use with care: changing the session ID affects analytics session attribution and session replay.
+    ///
+    /// - Parameter sessionId: Session ID to use for subsequent events.
     @objc public func setSessionId(_ sessionId: String) {
         setSessionIdInternal(sessionId, at: now(), reason: .customSessionId)
     }
@@ -121,6 +136,12 @@ import Foundation
         }
 
         return currentSessionId
+    }
+
+    /// Thread-safe snapshot of the cached app-background flag. Safe to read
+    /// from any thread.
+    var isAppInBackgroundSnapshot: Bool {
+        sessionLock.withLock { isAppInBackground }
     }
 
     func getNextSessionId() -> String? {
@@ -195,7 +216,7 @@ import Foundation
             }
         }
 
-        let newSessionId = UUID.v7().uuidString
+        let newSessionId = UUID.v7String()
         setSessionIdInternal(newSessionId, at: timestamp, reason: reason)
         return newSessionId
     }

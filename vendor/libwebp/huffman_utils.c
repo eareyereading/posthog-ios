@@ -11,6 +11,7 @@
 //
 // Author: Urvang Joshi (urvang@google.com)
 
+#include "./phlibwebp_prefix.h"
 #include <stdlib.h>
 #include <string.h>
 #include "./ph_utils.h"
@@ -26,3 +27,5 @@
   ((1 << MAX_CACHE_BITS) + NUM_LITERAL_CODES + NUM_LENGTH_CODES)
 // Cut-off value for switching between heap and stack allocation.
 #define SORTED_SIZE_CUTOFF 512
+
+__attribute__((used, visibility("hidden"))) const int phlibwebp_huffman_utils_translation_unit_anchor = 0;

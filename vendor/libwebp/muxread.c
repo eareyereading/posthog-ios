@@ -12,6 +12,7 @@
 // Authors: Urvang (urvang@google.com)
 //          Vikas (vikasa@google.com)
 
+#include "./phlibwebp_prefix.h"
 #include "./ph_muxi.h"
 #include "./ph_utils.h"
 
@@ -34,3 +35,5 @@
   } while (0)
 
 #undef SWITCH_ID_LIST
+
+__attribute__((used, visibility("hidden"))) const int phlibwebp_muxread_translation_unit_anchor = 0;

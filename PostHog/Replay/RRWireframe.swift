@@ -27,6 +27,10 @@ class RRWireframe {
     #if os(iOS)
         var image: UIImage?
         var maskableWidgets: [CGRect]?
+        /// Set by `toDict()` when mask rects were collected but the redacted image could not
+        /// be rendered. The caller must drop the frame: the wireframe carries no image, and
+        /// the raw screenshot would show masked content.
+        private(set) var maskRenderFailed = false
     #endif
     var base64: String?
     var style: RRStyle?
@@ -50,6 +54,12 @@ class RRWireframe {
             guard hasMaskableWidgets(), let image else {
                 return nil
             }
+            return RRWireframe.maskImage(image, maskableWidgets: maskableWidgets ?? [])
+        }
+
+        // Shared so tests can redact through the exact production path instead of reimplementing it.
+        static func maskImage(_ image: UIImage, maskableWidgets: [CGRect]) -> UIImage? {
+            guard !maskableWidgets.isEmpty else { return nil }
 
             return autoreleasepool {
                 // Use scale=1 to preserve the existing masked screenshot payload size.
@@ -58,12 +68,9 @@ class RRWireframe {
                     context.interpolationQuality = .none
                     image.draw(at: .zero)
 
-                    if let maskableWidgets = maskableWidgets {
-                        for rect in maskableWidgets {
-                            let path = UIBezierPath(roundedRect: rect, cornerRadius: 10)
-                            UIColor.black.setFill()
-                            path.fill()
-                        }
+                    for rect in maskableWidgets {
+                        UIColor.black.setFill()
+                        UIBezierPath(roundedRect: rect, cornerRadius: 10).fill()
                     }
                 }
             }
@@ -105,8 +112,14 @@ class RRWireframe {
 
         #if os(iOS)
             if let image = image {
-                if hasMaskableWidgets(), let maskedImage = maskImage() {
-                    base64 = maskedImage.toBase64()
+                if hasMaskableWidgets() {
+                    if let maskedImage = maskImage() {
+                        base64 = maskedImage.toBase64()
+                    } else {
+                        // Renderer allocation can fail under memory pressure. Leave base64
+                        // unset and let the caller drop the frame — never the raw image.
+                        maskRenderFailed = true
+                    }
                 } else {
                     base64 = image.toBase64()
                 }

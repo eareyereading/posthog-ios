@@ -26,13 +26,27 @@ let package = Package(
         .target(
             name: "PostHog",
             dependencies: [
+                "PostHogObjCExceptionSupport",
                 "phlibwebp",
                 .target(name: "PHPLCrashReporter", condition: .when(platforms: [.iOS, .macOS, .tvOS])),
             ],
             path: "PostHog",
+            exclude: [
+                "ObjCExceptionSupport",
+            ],
             resources: [
                 .copy("Resources/PrivacyInfo.xcprivacy"),
             ]
+        ),
+        .target(
+            name: "PostHogObjCExceptionSupport",
+            path: "PostHog/ObjCExceptionSupport",
+            publicHeadersPath: "."
+        ),
+        .target(
+            name: "PostHogTestsObjC",
+            path: "PostHogTestsObjC",
+            publicHeadersPath: "."
         ),
         .target(
             name: "phlibwebp",
@@ -62,7 +76,6 @@ let package = Package(
             ],
             sources: [
                 "Source",
-                "Dependencies/protobuf-c",
             ],
             resources: [.process("Resources/PrivacyInfo.xcprivacy")],
             publicHeadersPath: "include",
@@ -71,8 +84,6 @@ let package = Package(
                 .define("PLCF_RELEASE_BUILD"),
                 .define("PLCRASHREPORTER_PREFIX", to: "PH"),
                 .define("SWIFT_PACKAGE"),
-                .headerSearchPath("Dependencies/protobuf-c"),
-                .headerSearchPath("Dependencies/protobuf-c/protobuf-c"),
                 .headerSearchPath("Source"),
             ],
             linkerSettings: [
@@ -83,10 +94,13 @@ let package = Package(
             name: "PostHogTests",
             dependencies: [
                 "PostHog",
+                "PostHogTestsObjC",
                 "Quick",
                 "Nimble",
                 "OHHTTPStubs",
                 .product(name: "OHHTTPStubsSwift", package: "OHHTTPStubs"),
+                // The crash-report processor tests import this directly to build a PHPLCrashReport.
+                .target(name: "PHPLCrashReporter", condition: .when(platforms: [.iOS, .macOS, .tvOS])),
             ],
             path: "PostHogTests",
             resources: [

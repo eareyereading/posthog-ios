@@ -29,6 +29,76 @@ class RequestInterceptor: URLProtocol {
     static var trackedRequests: [TrackedRequest] = []
     static var totalEventsSent: Int = 0
 
+    private static let condition = NSCondition()
+    private static var _inFlightCount = 0
+    private static let proxySession = URLSession(configuration: .default)
+
+    static var inFlightCount: Int {
+        condition.lock()
+        defer { condition.unlock() }
+        return _inFlightCount
+    }
+
+    private static func incrementInFlight() {
+        condition.lock()
+        _inFlightCount += 1
+        condition.broadcast()
+        condition.unlock()
+    }
+
+    private static func decrementInFlight() {
+        condition.lock()
+        _inFlightCount = max(0, _inFlightCount - 1)
+        condition.broadcast()
+        condition.unlock()
+    }
+
+    /// Returns once the in-flight count has been 0 for `stabilityWindow` after seeing at least
+    /// one request, or after `gracePeriod` if nothing flew. Times out after `timeout`.
+    static func waitForFlushSettle(
+        timeout: TimeInterval = 30.0,
+        gracePeriod: TimeInterval = 0.1,
+        stabilityWindow: TimeInterval = 2.5
+    ) async {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global().async {
+                let absoluteDeadline = Date().addingTimeInterval(timeout)
+                var sawRequest = false
+                var idleSince: Date?
+
+                condition.lock()
+                defer { condition.unlock() }
+
+                while Date() < absoluteDeadline {
+                    if _inFlightCount > 0 {
+                        sawRequest = true
+                        idleSince = nil
+                    } else if idleSince == nil {
+                        idleSince = Date()
+                    }
+
+                    let wakeBy: Date = {
+                        guard let since = idleSince else { return absoluteDeadline }
+                        let window = sawRequest ? stabilityWindow : gracePeriod
+                        return min(since.addingTimeInterval(window), absoluteDeadline)
+                    }()
+
+                    if Date() >= wakeBy {
+                        if _inFlightCount == 0 {
+                            continuation.resume()
+                            return
+                        }
+                        continue
+                    }
+
+                    condition.wait(until: wakeBy)
+                }
+                print("[INTERCEPTOR] waitForFlushSettle timed out after \(timeout)s with \(_inFlightCount) in flight")
+                continuation.resume()
+            }
+        }
+    }
+
     override class func canInit(with request: URLRequest) -> Bool {
         // Only intercept requests to the mock server (not to real PostHog endpoints)
         guard let url = request.url else { return false }
@@ -54,14 +124,23 @@ class RequestInterceptor: URLProtocol {
         let request = self.request
         print("[INTERCEPTOR] startLoading called for: \(request.url?.absoluteString ?? "nil")")
 
-        // Capture the request body BEFORE sending (for upload tasks, httpBody contains the gzipped data)
-        let requestBody = request.httpBody
+        // Capture the request body BEFORE sending. Upload tasks may provide the body
+        // as a stream rather than httpBody, so normalize it onto the proxied request.
+        let requestBody = Self.extractBody(from: request)
+        var proxiedRequest = request
+        if proxiedRequest.httpBody == nil, let requestBody {
+            proxiedRequest.httpBody = requestBody
+        }
 
-        // Create a URLSession to actually perform the request
-        // IMPORTANT: Use .default to avoid recursion (our custom config is only for PostHog SDK)
-        let session = URLSession(configuration: .default)
-        let task = session.dataTask(with: request) { [weak self] data, response, error in
-            print("[INTERCEPTOR] Task completed for: \(request.url?.absoluteString ?? "nil"), error: \(error?.localizedDescription ?? "none")")
+        // Actually perform the request. Keep the proxy session alive for the process;
+        // a local URLSession can be deallocated while the task is still running, which
+        // leaves /flush waiting forever for in-flight interception to settle.
+        let task = Self.proxySession.dataTask(with: proxiedRequest) { [weak self] data, response, error in
+            // Decrement only after every URLProtocol client callback has fired, so the SDK
+            // has fully processed the response (including any sync retry/queue hand-off)
+            // before waitForFlushSettle can see in-flight = 0.
+            defer { Self.decrementInFlight() }
+            print("[INTERCEPTOR] Task completed for: \(proxiedRequest.url?.absoluteString ?? "nil"), error: \(error?.localizedDescription ?? "none")")
             guard let self = self else { return }
 
             if let error = error {
@@ -75,20 +154,50 @@ class RequestInterceptor: URLProtocol {
             }
 
             // Track the request (pass the captured body)
-            self.trackRequest(request: request, response: httpResponse, requestBody: requestBody)
+            self.trackRequest(request: proxiedRequest, response: httpResponse, requestBody: requestBody)
 
-            // Forward the response to the client
+            // Forward the response to the client in URLProtocol's expected order.
+            self.client?.urlProtocol(self, didReceive: httpResponse, cacheStoragePolicy: .notAllowed)
             if let data = data {
                 self.client?.urlProtocol(self, didLoad: data)
             }
-            self.client?.urlProtocol(self, didReceive: httpResponse, cacheStoragePolicy: .notAllowed)
             self.client?.urlProtocolDidFinishLoading(self)
         }
+        Self.incrementInFlight()
         task.resume()
     }
 
     override func stopLoading() {
         // Nothing to do
+    }
+
+    private static func extractBody(from request: URLRequest) -> Data? {
+        if let body = request.httpBody {
+            return body
+        }
+
+        guard let stream = request.httpBodyStream else {
+            return nil
+        }
+
+        stream.open()
+        defer { stream.close() }
+
+        var data = Data()
+        let bufferSize = 16 * 1024
+        let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: bufferSize)
+        defer { buffer.deallocate() }
+
+        while stream.hasBytesAvailable {
+            let read = stream.read(buffer, maxLength: bufferSize)
+            if read > 0 {
+                data.append(buffer, count: read)
+            } else {
+                break
+            }
+        }
+
+        return data.isEmpty ? nil : data
     }
 
     private func trackRequest(request: URLRequest, response: HTTPURLResponse, requestBody: Data?) {
@@ -170,6 +279,10 @@ class RequestInterceptor: URLProtocol {
     static func reset() {
         trackedRequests = []
         totalEventsSent = 0
+        condition.lock()
+        _inFlightCount = 0
+        condition.broadcast()
+        condition.unlock()
         print("[INTERCEPTOR] Reset state")
     }
 }

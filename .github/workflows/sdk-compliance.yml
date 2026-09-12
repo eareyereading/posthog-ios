@@ -3,7 +3,7 @@ name: SDK Compliance Tests
 # NOTE: This workflow is adapted from PostHog/posthog-sdk-test-harness/.github/workflows/test-sdk-action.yml
 # Key difference: Uses HYBRID RUNNER architecture because iOS SDK requires macOS (Darwin frameworks)
 # - Standard action: Runs everything in Docker on ubuntu-latest
-# - This workflow: Runs adapter natively on macos-latest, test harness in Docker
+# - This workflow: Runs adapter natively on a macOS runner, test harness in Docker
 #
 # Why: iOS SDK depends on SystemConfiguration, Foundation, UIKit which don't exist on Linux
 
@@ -16,9 +16,16 @@ on:
       - 'sdk_compliance_adapter/**'
       - '.github/workflows/sdk-compliance.yml'
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   compliance-tests:
-    # NOTE: Using macos-15-intel (Intel) instead of macos-latest (Apple Silicon)
+    # Fork pull requests receive a read-only token and cannot publish the report comment.
+    # Skip the entire job instead of spending macOS runner time on a check that will fail at the end.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    # NOTE: Using macos-15-intel (Intel) instead of macos-26 (Apple Silicon)
     # Reason: Apple Silicon runners don't support nested virtualization needed for Docker
     # See: https://github.com/actions/runner-images/issues/9460
     runs-on: macos-15-intel
@@ -29,10 +36,10 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup Xcode
-        uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # v1
+        uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # v1.7.0
         with:
           xcode-version: latest-stable
 
@@ -53,7 +60,7 @@ jobs:
           docker-compose --version
 
       - name: Cache Swift build artifacts
-        uses: actions/cache@v5
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             sdk_compliance_adapter/.build
@@ -106,7 +113,7 @@ jobs:
 
       - name: Upload adapter logs
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: adapter-logs
           path: sdk_compliance_adapter/adapter*.log
@@ -114,7 +121,7 @@ jobs:
 
       - name: Upload test report
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: sdk-compliance-report
           path: report/sdk-compliance-report.md
@@ -134,7 +141,7 @@ jobs:
 
       - name: Comment on PR
         if: always() && github.event_name == 'pull_request'
-        uses: actions/github-script@v9
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           REPORT_PATH: ${{ github.workspace }}/report/sdk-compliance-report.md
           SDK_NAME: ${{ steps.extract-sdk-name.outputs.sdk-name }}
