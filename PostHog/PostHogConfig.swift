@@ -225,7 +225,6 @@ public typealias BeforeSendBlock = (PostHogEvent) -> PostHogEvent?
         /// Requires `enableSwizzling = true`.
         /// Default: `false`.
         @objc public var captureElementInteractions: Bool = false
-        @objc public var captureScrollViewSwipeInteractions: Bool = false
 
         /// Rage click detection configuration.
         @objc public let rageClickConfig: PostHogRageClickConfig = .init()

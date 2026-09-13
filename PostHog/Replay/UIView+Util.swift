@@ -53,16 +53,6 @@
             containsAccessibilityToken("ph-no-capture")
         }
 
-        /// Fork-local split of `ph-no-capture`: `ph-no-capture-events` suppresses autocapture
-        /// only, `ph-no-capture-replays` suppresses session replay only.
-        func isNoCaptureEvents() -> Bool {
-            containsAccessibilityToken("ph-no-capture-events")
-        }
-
-        func isNoCaptureReplays() -> Bool {
-            containsAccessibilityToken("ph-no-capture-replays")
-        }
-
         /// Whether this view (and its subviews) is explicitly marked as non-maskable, via the
         /// `.postHogNoMask()` modifier or a `ph-no-mask` token on its `accessibilityIdentifier`
         /// or `accessibilityLabel` — the carriers React Native can reach, since it cannot apply
