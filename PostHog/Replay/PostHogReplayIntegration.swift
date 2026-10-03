@@ -1244,19 +1244,27 @@
         }
 
         private func isAnimatingTransition(_ viewController: UIViewController) -> Bool {
-            // Check if this view controller is animating
-            if viewController.transitionCoordinator?.isAnimated ?? false {
-                return true
-            }
+            // Visit each view controller once. `presentedViewController` is documented to return
+            // the controller presented by this one *or one of its ancestors*, so every child of a
+            // presenting controller reports the same presented controller. A plain recursion walks
+            // that presented subtree again from each child, which grows exponentially with the
+            // hierarchy depth (observed: recursion 29 levels deep, ~0.4s of main thread per
+            // capture on a modally presented page-based screen).
+            var visited = Set<ObjectIdentifier>()
+            var pending = [viewController]
+            while let current = pending.popLast() {
+                guard visited.insert(ObjectIdentifier(current)).inserted else { continue }
 
-            // Check if presented view controller is animating
-            if let presented = viewController.presentedViewController, isAnimatingTransition(presented) {
-                return true
-            }
+                // Check if this view controller is animating
+                if current.transitionCoordinator?.isAnimated ?? false {
+                    return true
+                }
 
-            // Check if any of the child view controllers is animating
-            if viewController.children.first(where: isAnimatingTransition) != nil {
-                return true
+                // Check the presented view controller and the child view controllers
+                if let presented = current.presentedViewController {
+                    pending.append(presented)
+                }
+                pending.append(contentsOf: current.children)
             }
 
             return false
